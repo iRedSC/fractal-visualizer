@@ -11,6 +11,7 @@ cmds = ["npm run build"]
 
 [variables]
 NODE_ENV = "production"
+NIXPACKS_NODE_VERSION = "22"
 NIXPACKS_SPA_OUT_DIR = "dist"
 # Port for Caddy to listen on (Dokploy sets PORT at runtime; override in env vars if needed)
 PORT = "3000"
