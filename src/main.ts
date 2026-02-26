@@ -4,6 +4,10 @@ import './style.css';
 
 const ORBIT_CAPACITY = 256;
 const ORBIT_CACHE_LIMIT = 12;
+const TARGET_FPS = 58;
+const QUALITY_MIN = 0.35;
+const QUALITY_MAX = 2.2;
+const INTERACTION_RECALC_DEBOUNCE_MS = 48;
 
 const vertexSrc = `
     in vec2 aPosition;
@@ -26,6 +30,7 @@ const fragmentSrc = `
     uniform vec2 uCenterY;
     uniform vec2 uInvZoom;
     uniform int uMaxIterations;
+    uniform int uColorIterations;
     uniform int uLod;
     uniform int uPrecisionMode;
     uniform int uUsePerturb;
@@ -268,9 +273,10 @@ const fragmentSrc = `
         return -1.0;
     }
 
-    vec3 colorFromSmooth(float smoothIter, float maxIter) {
+    vec3 colorFromSmooth(float smoothIter) {
         if (smoothIter < 0.0) return vec3(0.0);
-        float t = pow(clamp(smoothIter / maxIter, 0.0, 1.0), 0.6);
+        float colorIter = max(1.0, float(uColorIterations));
+        float t = pow(clamp(smoothIter / colorIter, 0.0, 1.0), 0.6);
         return gradient(t);
     }
 
@@ -356,7 +362,7 @@ const fragmentSrc = `
             float sPerturb = mandelbrotSmoothPerturb(dc, pixelPosDS, maxIter);
             s = mix(sDirect, sPerturb, uPerturbBlend);
         }
-        return colorFromSmooth(s, maxIter);
+        return colorFromSmooth(s);
     }
 
     void main() {
@@ -404,6 +410,79 @@ async function init() {
 
     document.getElementById('app')!.appendChild(app.canvas);
 
+    const controlsPanel = document.createElement('details');
+    controlsPanel.className = 'hud-panel controls-panel';
+    controlsPanel.open = true;
+    controlsPanel.innerHTML = `
+        <summary>Controls</summary>
+        <ul class="controls-list">
+            <li><strong>Scroll:</strong> zoom in/out</li>
+            <li><strong>Middle drag:</strong> pan camera</li>
+            <li><strong>Left drag:</strong> adjust active parameter (Julia C / Mandelbrot z0)</li>
+            <li><strong>Right drag:</strong> blend mode (X) and exponent (Y)</li>
+            <li><strong>Mobile:</strong> 1 finger = left drag, 2 fingers = right drag, pinch = zoom</li>
+            <li><strong>Double left click:</strong> release manual C / z0 control</li>
+            <li><strong>Space:</strong> pause/resume animation</li>
+        </ul>
+    `;
+    document.body.appendChild(controlsPanel);
+
+    const paramsPanel = document.createElement('details');
+    paramsPanel.className = 'hud-panel params-panel';
+    paramsPanel.open = true;
+    const paramsTitle = document.createElement('summary');
+    paramsTitle.textContent = 'Live Parameters';
+    paramsPanel.appendChild(paramsTitle);
+    const paramsBody = document.createElement('div');
+    paramsBody.className = 'params-body';
+    paramsPanel.appendChild(paramsBody);
+    document.body.appendChild(paramsPanel);
+
+    const createParamRow = (label: string) => {
+        const row = document.createElement('div');
+        row.className = 'param-row';
+        const labelEl = document.createElement('span');
+        labelEl.className = 'param-label';
+        labelEl.textContent = label;
+        const bar = document.createElement('div');
+        bar.className = 'param-bar';
+        const fill = document.createElement('div');
+        fill.className = 'param-bar-fill';
+        bar.appendChild(fill);
+        const valueEl = document.createElement('span');
+        valueEl.className = 'param-value';
+        valueEl.textContent = '0.00';
+        row.appendChild(labelEl);
+        row.appendChild(bar);
+        row.appendChild(valueEl);
+        paramsBody.appendChild(row);
+        return {
+            set(value01: number, text: string) {
+                const clamped = Math.max(0, Math.min(1, value01));
+                fill.style.width = `${(clamped * 100).toFixed(1)}%`;
+                valueEl.textContent = text;
+            },
+        };
+    };
+
+    const paramRows = {
+        modeBlend: createParamRow('Mode blend'),
+        exponent: createParamRow('Exponent'),
+        cReal: createParamRow('C real'),
+        cImag: createParamRow('C imag'),
+        z0Real: createParamRow('z0 real'),
+        z0Imag: createParamRow('z0 imag'),
+        zoom: createParamRow('Zoom'),
+        iterations: createParamRow('Iterations'),
+        fps: createParamRow('FPS'),
+        quality: createParamRow('Capacity'),
+    };
+
+    const normalize = (value: number, min: number, max: number) => {
+        if (max <= min) return 0;
+        return (value - min) / (max - min);
+    };
+
     const viewport = new Viewport({
         screenWidth: window.innerWidth,
         screenHeight: window.innerHeight,
@@ -429,7 +508,7 @@ async function init() {
     let blendDragStart: { x: number; y: number; blend: number; exponent: number } | null = null;
     let modeBlend = 1;
     let exponent = 2;
-    let animationPaused = false;
+    let animationPaused = true;
     const blendSensitivity = 0.0015;
     const exponentSensitivity = 0.003;
 
@@ -438,7 +517,20 @@ async function init() {
         return { x: clientX - rect.left, y: clientY - rect.top };
     };
 
+    const isMobileDevice = window.matchMedia('(pointer: coarse)').matches
+        || navigator.maxTouchPoints > 0
+        || /Mobi|Android|iPhone|iPad|iPod/i.test(navigator.userAgent);
+    const getTouchDistance = (a: Touch, b: Touch) => Math.hypot(a.clientX - b.clientX, a.clientY - b.clientY);
+    const getTouchMidpoint = (a: Touch, b: Touch) => ({
+        x: (a.clientX + b.clientX) * 0.5,
+        y: (a.clientY + b.clientY) * 0.5,
+    });
+
+    let pinchStart: { distance: number; zoom: number } | null = null;
+    let touchTwoFingerStart: { x: number; y: number; blend: number; exponent: number } | null = null;
+
     const onPointerDown = (e: PointerEvent) => {
+        if (e.pointerType === 'touch') return;
         const { x, y } = getCanvasCoords(e.clientX, e.clientY);
         if (e.button === 0) {
             if (e.detail === 2) {
@@ -473,10 +565,12 @@ async function init() {
         }
     };
     const onPointerMove = (e: PointerEvent) => {
+        if (e.pointerType === 'touch') return;
         const { x, y } = getCanvasCoords(e.clientX, e.clientY);
         if (e.buttons & 1 && dragStart) {
             const dx = x - dragStart.x;
             const dy = y - dragStart.y;
+            lastInteractionAt = performance.now();
             const rawReal = dragStart.real + paramSensitivity * dx;
             const rawImag = dragStart.imag - paramSensitivity * dy;
             if (dragStart.isJulia) {
@@ -495,6 +589,7 @@ async function init() {
             const dy = y - panStart.y;
             cameraCenterX = panStart.centerX - dx / cameraZoom;
             cameraCenterY = panStart.centerY + dy / cameraZoom;
+            lastInteractionAt = performance.now();
             cameraVersion += 1;
             activeOrbitVersion = -1;
         } else if ((e.buttons & 2) && blendDragStart) {
@@ -502,9 +597,11 @@ async function init() {
             const dy = y - blendDragStart.y;
             modeBlend = Math.max(0, Math.min(1, blendDragStart.blend + blendSensitivity * dx));
             exponent = Math.max(1.01, Math.min(8, blendDragStart.exponent - exponentSensitivity * dy));
+            lastInteractionAt = performance.now();
         }
     };
     const onPointerUp = (e: PointerEvent) => {
+        if (e.pointerType === 'touch') return;
         if (e.button === 0) dragStart = null;
         if (e.button === 1) panStart = null;
         if (e.button === 2) blendDragStart = null;
@@ -513,11 +610,135 @@ async function init() {
         blendDragStart = null;
         panStart = null;
     };
+
+    const onTouchStart = (e: TouchEvent) => {
+        if (!isMobileDevice) return;
+        if (e.touches.length === 1) {
+            const touch = e.touches[0];
+            const { x, y } = getCanvasCoords(touch.clientX, touch.clientY);
+            const isJulia = modeBlend > 0.5;
+            const lim = isJulia ? cLimits : z0Limits;
+            const rawReal = isJulia
+                ? (mouseControlC?.real ?? uniforms.uniforms.uC[0])
+                : (mouseControlZ0?.real ?? uniforms.uniforms.uZ0[0]);
+            const rawImag = isJulia
+                ? (mouseControlC?.imag ?? uniforms.uniforms.uC[1])
+                : (mouseControlZ0?.imag ?? uniforms.uniforms.uZ0[1]);
+            const real = Math.max(lim.realMin, Math.min(lim.realMax, rawReal));
+            const imag = Math.max(lim.imagMin, Math.min(lim.imagMax, rawImag));
+            dragStart = { x, y, real, imag, isJulia };
+            if (isJulia) {
+                mouseControlC = { real, imag };
+            } else {
+                mouseControlZ0 = { real, imag };
+            }
+            blendDragStart = null;
+            touchTwoFingerStart = null;
+            pinchStart = null;
+            animationPaused = true;
+        } else if (e.touches.length >= 2) {
+            const a = e.touches[0];
+            const b = e.touches[1];
+            const midpoint = getTouchMidpoint(a, b);
+            const { x, y } = getCanvasCoords(midpoint.x, midpoint.y);
+            touchTwoFingerStart = { x, y, blend: modeBlend, exponent };
+            blendDragStart = { x, y, blend: modeBlend, exponent };
+            pinchStart = { distance: Math.max(1, getTouchDistance(a, b)), zoom: cameraZoom };
+            dragStart = null;
+            animationPaused = true;
+        }
+        e.preventDefault();
+    };
+
+    const onTouchMove = (e: TouchEvent) => {
+        if (!isMobileDevice) return;
+        if (e.touches.length === 1 && dragStart) {
+            const touch = e.touches[0];
+            const { x, y } = getCanvasCoords(touch.clientX, touch.clientY);
+            const dx = x - dragStart.x;
+            const dy = y - dragStart.y;
+            lastInteractionAt = performance.now();
+            const rawReal = dragStart.real + paramSensitivity * dx;
+            const rawImag = dragStart.imag - paramSensitivity * dy;
+            if (dragStart.isJulia) {
+                mouseControlC = {
+                    real: Math.max(cLimits.realMin, Math.min(cLimits.realMax, rawReal)),
+                    imag: Math.max(cLimits.imagMin, Math.min(cLimits.imagMax, rawImag)),
+                };
+            } else {
+                mouseControlZ0 = {
+                    real: Math.max(z0Limits.realMin, Math.min(z0Limits.realMax, rawReal)),
+                    imag: Math.max(z0Limits.imagMin, Math.min(z0Limits.imagMax, rawImag)),
+                };
+            }
+        } else if (e.touches.length >= 2) {
+            const a = e.touches[0];
+            const b = e.touches[1];
+
+            if (!touchTwoFingerStart) {
+                const midpoint = getTouchMidpoint(a, b);
+                const { x, y } = getCanvasCoords(midpoint.x, midpoint.y);
+                touchTwoFingerStart = { x, y, blend: modeBlend, exponent };
+                blendDragStart = { x, y, blend: modeBlend, exponent };
+            }
+            if (!pinchStart) {
+                pinchStart = { distance: Math.max(1, getTouchDistance(a, b)), zoom: cameraZoom };
+            }
+
+            const midpoint = getTouchMidpoint(a, b);
+            const { x, y } = getCanvasCoords(midpoint.x, midpoint.y);
+            const dx = x - touchTwoFingerStart.x;
+            const dy = y - touchTwoFingerStart.y;
+            modeBlend = Math.max(0, Math.min(1, touchTwoFingerStart.blend + blendSensitivity * dx));
+            exponent = Math.max(1.01, Math.min(8, touchTwoFingerStart.exponent - exponentSensitivity * dy));
+
+            const distance = Math.max(1, getTouchDistance(a, b));
+            const zoomScale = distance / pinchStart.distance;
+            cameraZoom = Math.max(1e-3, Math.min(Number.MAX_VALUE, pinchStart.zoom * zoomScale));
+            cameraVersion += 1;
+            activeOrbitVersion = -1;
+            lastInteractionAt = performance.now();
+        }
+        e.preventDefault();
+    };
+
+    const onTouchEnd = (e: TouchEvent) => {
+        if (!isMobileDevice) return;
+        if (e.touches.length === 0) {
+            dragStart = null;
+            blendDragStart = null;
+            touchTwoFingerStart = null;
+            pinchStart = null;
+        } else if (e.touches.length === 1) {
+            blendDragStart = null;
+            touchTwoFingerStart = null;
+            pinchStart = null;
+            const touch = e.touches[0];
+            const { x, y } = getCanvasCoords(touch.clientX, touch.clientY);
+            const isJulia = modeBlend > 0.5;
+            const lim = isJulia ? cLimits : z0Limits;
+            const rawReal = isJulia
+                ? (mouseControlC?.real ?? uniforms.uniforms.uC[0])
+                : (mouseControlZ0?.real ?? uniforms.uniforms.uZ0[0]);
+            const rawImag = isJulia
+                ? (mouseControlC?.imag ?? uniforms.uniforms.uC[1])
+                : (mouseControlZ0?.imag ?? uniforms.uniforms.uZ0[1]);
+            const real = Math.max(lim.realMin, Math.min(lim.realMax, rawReal));
+            const imag = Math.max(lim.imagMin, Math.min(lim.imagMax, rawImag));
+            dragStart = { x, y, real, imag, isJulia };
+        }
+        e.preventDefault();
+    };
+
     app.canvas.addEventListener('pointerdown', onPointerDown);
     app.canvas.addEventListener('pointermove', onPointerMove);
     app.canvas.addEventListener('pointerup', onPointerUp);
     app.canvas.addEventListener('pointerleave', onPointerLeave);
     app.canvas.addEventListener('contextmenu', (e) => e.preventDefault());
+    app.canvas.addEventListener('touchstart', onTouchStart, { passive: false });
+    app.canvas.addEventListener('touchmove', onTouchMove, { passive: false });
+    app.canvas.addEventListener('touchend', onTouchEnd, { passive: false });
+    app.canvas.addEventListener('touchcancel', onTouchEnd, { passive: false });
 
     window.addEventListener('keydown', (e: KeyboardEvent) => {
         if (e.code === 'Space') {
@@ -589,6 +810,7 @@ async function init() {
         uCenterY: { value: new Float32Array(splitDouble(0)), type: 'vec2<f32>' },
         uInvZoom: { value: new Float32Array(splitDouble(1 / cameraZoom)), type: 'vec2<f32>' },
         uMaxIterations: { value: 200, type: 'i32' },
+        uColorIterations: { value: 320, type: 'i32' },
         uLod: { value: 0, type: 'i32' },
         uPrecisionMode: { value: 0, type: 'i32' },
         uUsePerturb: { value: 0, type: 'i32' },
@@ -622,6 +844,7 @@ async function init() {
 
         latestAppliedOrbitId = id;
         applyOrbit(orbit, length, lastOrbitCenterX, lastOrbitCenterY, lastOrbitZoom, version);
+        orbitUpdatedSinceLastFrame = true;
 
         orbitCache.push({
             centerX: lastOrbitCenterX,
@@ -639,13 +862,26 @@ async function init() {
 
     let lastInteractionAt = performance.now();
     let currentIterations = 220;
+    let qualityScale = 1.0;
+    let smoothedFrameMs = 1000 / 60;
+    let discoveredCapacity = currentIterations;
+    let colorIterations = 320;
+    let lodState = 1;
+    let orbitUpdatedSinceLastFrame = false;
+    let lastAdaptiveUpdateAt = 0;
 
     app.ticker.add(() => {
+        const frameMs = app.ticker.deltaMS;
         const deltaCenter = viewport.center;
         const deltaScale = viewport.scaled;
         const hadInteraction = Math.abs(deltaCenter.x) > 1e-7
             || Math.abs(deltaCenter.y) > 1e-7
             || Math.abs(deltaScale - 1) > 1e-7;
+        const activeInput = dragStart !== null
+            || panStart !== null
+            || blendDragStart !== null
+            || touchTwoFingerStart !== null
+            || pinchStart !== null;
 
         if (hadInteraction) {
             const zoomBefore = cameraZoom;
@@ -659,10 +895,12 @@ async function init() {
             activeOrbitVersion = -1;
         }
 
+        const nowMs = performance.now();
         const zoom = cameraZoom;
         const res = app.renderer.width / app.renderer.resolution;
         const resY = app.renderer.height / app.renderer.resolution;
-        const idleMs = performance.now() - lastInteractionAt;
+        const idleMs = nowMs - lastInteractionAt;
+        const activelyInteracting = activeInput || hadInteraction || idleMs < 180;
         const [centerXHi, centerXLo] = splitDouble(cameraCenterX);
         const [centerYHi, centerYLo] = splitDouble(cameraCenterY);
         const [invZoomHi, invZoomLo] = splitDouble(1 / zoom);
@@ -676,7 +914,9 @@ async function init() {
         uniforms.uniforms.uInvZoom[0] = invZoomHi;
         uniforms.uniforms.uInvZoom[1] = invZoomLo;
         const t = performance.now() * 0.001;
-        uniforms.uniforms.uTime = t;
+        if (!animationPaused) {
+            uniforms.uniforms.uTime = t;
+        }
 
         const wobblePeriod = 90.0;
         const wobbleOmega = (2 * Math.PI) / wobblePeriod;
@@ -725,8 +965,47 @@ async function init() {
         }
         uniforms.uniforms.uModeBlend = modeBlend;
         uniforms.uniforms.uExponent = exponent;
+        const hadOrbitUpdate = orbitUpdatedSinceLastFrame;
+        const dynamicUpdate = activelyInteracting || !animationPaused || hadOrbitUpdate;
+        const interactionDebounceReady = !activelyInteracting
+            || (nowMs - lastAdaptiveUpdateAt) >= INTERACTION_RECALC_DEBOUNCE_MS;
+        const adaptiveUpdate = dynamicUpdate && (
+            hadOrbitUpdate
+            || !activelyInteracting
+            || !animationPaused
+            || interactionDebounceReady
+        );
+        if (adaptiveUpdate) {
+            lastAdaptiveUpdateAt = nowMs;
+        }
+        orbitUpdatedSinceLastFrame = false;
 
-        uniforms.uniforms.uLod = 1;
+        const targetFrameMs = 1000 / TARGET_FPS;
+        if (adaptiveUpdate) {
+            smoothedFrameMs = smoothedFrameMs * 0.9 + frameMs * 0.1;
+            if (smoothedFrameMs > targetFrameMs * 1.16) {
+                qualityScale *= 0.94;
+            } else if (smoothedFrameMs < targetFrameMs * 0.9) {
+                qualityScale *= 1.015;
+            }
+            if (frameMs > targetFrameMs * 1.7) {
+                qualityScale *= 0.86;
+            }
+            qualityScale = Math.max(QUALITY_MIN, Math.min(QUALITY_MAX, qualityScale));
+        }
+        const effectiveQuality = activelyInteracting ? Math.max(QUALITY_MIN, qualityScale * 0.62) : qualityScale;
+
+        if (adaptiveUpdate) {
+            if (lodState <= 0) {
+                if (effectiveQuality > 0.94) lodState = 1;
+            } else if (lodState === 1) {
+                if (effectiveQuality < 0.72) lodState = 0;
+                else if (effectiveQuality > 1.86 && !activelyInteracting) lodState = 2;
+            } else {
+                if (effectiveQuality < 1.5 || activelyInteracting) lodState = 1;
+            }
+        }
+        uniforms.uniforms.uLod = lodState;
         uniforms.uniforms.uPrecisionMode = 0;
 
         const orbitDriftPxRaw = Math.hypot(
@@ -792,16 +1071,51 @@ async function init() {
             });
         }
 
-        const iterBase = 240 + Math.log2(Math.max(1, zoom)) * 58;
-        const iterBoost = 1.0;
-        const iterTarget = Math.min(4096, Math.floor(iterBase * iterBoost));
-        const maxStep = 200;
-        if (currentIterations < iterTarget) {
-            currentIterations = Math.min(iterTarget, currentIterations + maxStep);
-        } else {
-            currentIterations = Math.max(iterTarget, currentIterations - maxStep * 2);
+        if (adaptiveUpdate) {
+            const iterBase = 240 + Math.log2(Math.max(1, zoom)) * 58;
+            const iterTarget = Math.min(4096, Math.floor(iterBase * effectiveQuality));
+            const maxStep = 200;
+            if (currentIterations < iterTarget) {
+                currentIterations = Math.min(iterTarget, currentIterations + maxStep);
+            } else {
+                currentIterations = Math.max(iterTarget, currentIterations - maxStep * 2);
+            }
+            uniforms.uniforms.uMaxIterations = Math.floor(currentIterations);
+
+            const colorTarget = Math.min(4096, Math.floor(iterBase));
+            if (colorIterations < colorTarget) {
+                colorIterations = Math.min(colorTarget, colorIterations + 24);
+            } else {
+                colorIterations = Math.max(colorTarget, colorIterations - 4);
+            }
+            uniforms.uniforms.uColorIterations = colorIterations;
+            if (!activelyInteracting && smoothedFrameMs <= targetFrameMs * 1.04) {
+                discoveredCapacity = Math.max(discoveredCapacity, uniforms.uniforms.uMaxIterations);
+            }
         }
-        uniforms.uniforms.uMaxIterations = Math.floor(currentIterations);
+
+        const cReal = uniforms.uniforms.uC[0];
+        const cImag = uniforms.uniforms.uC[1];
+        const z0Real = uniforms.uniforms.uZ0[0];
+        const z0Imag = uniforms.uniforms.uZ0[1];
+
+        paramRows.modeBlend.set(modeBlend, modeBlend.toFixed(2));
+        paramRows.exponent.set(normalize(exponent, 1.01, 8), exponent.toFixed(2));
+        paramRows.cReal.set(normalize(cReal, cLimits.realMin, cLimits.realMax), cReal.toFixed(3));
+        paramRows.cImag.set(normalize(cImag, cLimits.imagMin, cLimits.imagMax), cImag.toFixed(3));
+        paramRows.z0Real.set(normalize(z0Real, z0Limits.realMin, z0Limits.realMax), z0Real.toFixed(3));
+        paramRows.z0Imag.set(normalize(z0Imag, z0Limits.imagMin, z0Limits.imagMax), z0Imag.toFixed(3));
+
+        const logZoom = Math.log10(Math.max(1, zoom));
+        paramRows.zoom.set(Math.min(1, logZoom / 12), zoom.toExponential(2));
+        const maxIterations = uniforms.uniforms.uMaxIterations;
+        paramRows.iterations.set(Math.min(1, maxIterations / 4096), maxIterations.toString());
+        const fps = 1000 / Math.max(0.0001, smoothedFrameMs);
+        paramRows.fps.set(Math.min(1, fps / 120), fps.toFixed(1));
+        paramRows.quality.set(
+            Math.min(1, discoveredCapacity / 4096),
+            `${Math.round(qualityScale * 100)}% (${discoveredCapacity} it)`,
+        );
     });
 
     window.addEventListener('resize', () => {

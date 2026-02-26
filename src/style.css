@@ -12,4 +12,106 @@ body, html {
 }
 canvas {
     display: block;
+    touch-action: none;
+}
+
+.hud-panel {
+    position: fixed;
+    bottom: 12px;
+    z-index: 10;
+    color: rgba(230, 236, 255, 0.95);
+    background: rgba(10, 14, 24, 0.42);
+    border: 1px solid rgba(170, 194, 255, 0.3);
+    border-radius: 10px;
+    backdrop-filter: blur(6px);
+    -webkit-backdrop-filter: blur(6px);
+    box-shadow: 0 6px 24px rgba(0, 0, 0, 0.25);
+    font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif;
+    font-size: 12px;
+    line-height: 1.35;
+}
+
+.hud-panel > summary {
+    margin: 0;
+    padding: 0;
+    font-size: 12px;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    opacity: 0.9;
+    cursor: pointer;
+    user-select: none;
+    list-style-position: inside;
+}
+
+.controls-panel {
+    right: 12px;
+    width: 270px;
+    padding: 8px 10px;
+}
+
+.hud-panel > summary::marker {
+    color: rgba(214, 229, 255, 0.85);
+}
+
+.hud-panel[open] > summary {
+    margin-bottom: 6px;
+}
+
+.controls-list {
+    margin: 8px 0 0;
+    padding-left: 16px;
+}
+
+.controls-list li {
+    margin: 3px 0;
+    opacity: 0.92;
+}
+
+.params-panel {
+    left: 12px;
+    width: 270px;
+    padding: 8px 10px 10px;
+}
+
+.params-body {
+    margin-top: 2px;
+}
+
+.param-row {
+    display: grid;
+    grid-template-columns: 74px minmax(0, 1fr) 88px;
+    align-items: center;
+    gap: 8px;
+    margin: 4px 0;
+}
+
+.param-label {
+    opacity: 0.84;
+}
+
+.param-value {
+    text-align: right;
+    font-variant-numeric: tabular-nums;
+    white-space: nowrap;
+    opacity: 0.94;
+}
+
+.param-bar {
+    position: relative;
+    height: 6px;
+    border-radius: 999px;
+    background: rgba(160, 180, 220, 0.22);
+    overflow: hidden;
+}
+
+.param-bar-fill {
+    position: absolute;
+    left: 0;
+    top: 0;
+    width: 0;
+    height: 100%;
+    border-radius: inherit;
+    background: linear-gradient(90deg, rgba(125, 188, 255, 0.92), rgba(183, 146, 255, 0.95));
+    transition: width 120ms linear;
 }
