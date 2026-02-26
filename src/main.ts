@@ -42,6 +42,7 @@ const fragmentSrc = `#version 300 es
     uniform vec2 uCenterRefOffsetX;
     uniform vec2 uCenterRefOffsetY;
     uniform float uPerturbDcCoeff;
+    uniform float uPerturbDz0Coeff;
     uniform float uTime;
     uniform vec2 uC;
     uniform vec2 uZ0;
@@ -319,7 +320,7 @@ const fragmentSrc = `#version 300 es
         int limit = uRefLength;
         if (maxLimit < limit) limit = maxLimit;
         if (limit > 1024) limit = 1024;
-        vec4 dz = vec4(0.0);
+        vec4 dz = dsComplexScale(dcFull, uPerturbDz0Coeff);
         float iter = 0.0;
         vec4 z = vec4(0.0);
         bool needFullPrecision = false;
@@ -445,7 +446,7 @@ const fragmentSrc = `#version 300 es
             vec2 dcx = dsAdd(uCenterRefOffsetX, dsMulFloat(uInvZoom, dx));
             vec2 dcy = dsAdd(uCenterRefOffsetY, dsMulFloat(uInvZoom, dy));
             vec4 dc = vec4(dcx.x, dcx.y, dcy.x, dcy.y);
-            float sPerturb = mandelbrotSmoothPerturb(dc, pixelPosDS, maxIter);
+            float sPerturb = mandelbrotSmoothPerturb(dc, cFull, maxIter);
             s = mix(sDirect, sPerturb, uPerturbBlend);
         }
         return colorFromSmooth(s);
@@ -587,6 +588,8 @@ async function init() {
     };
     resize();
 
+    const baseZoom = Math.min(canvas.width, canvas.height) / 3.5;
+
     const controlsPanel = document.createElement('details');
     controlsPanel.className = 'hud-panel controls-panel';
     controlsPanel.open = true;
@@ -660,8 +663,6 @@ async function init() {
         return (value - min) / (max - min);
     };
 
-    const baseZoom = Math.min(window.innerWidth, window.innerHeight) / 3.5;
-
     let cameraCenterXDD: DoubleDouble = ddFromNumber(-0.5);
     let cameraCenterYDD: DoubleDouble = ddFromNumber(0);
     let cameraZoom = baseZoom;
@@ -674,10 +675,20 @@ async function init() {
     let lastOrbitCenterYDD: DoubleDouble = [cameraCenterYDD[0], cameraCenterYDD[1]];
     let lastOrbitZoom = cameraZoom;
     let lastOrbitModeBlend = 0;
+    let lastOrbitCRe = 0.285;
+    let lastOrbitCIm = 0.01;
+    let lastOrbitZ0Re = 0;
+    let lastOrbitZ0Im = 0;
+    let lastOrbitExponent = 2;
     let requestedOrbitCenterXDD: DoubleDouble = [cameraCenterXDD[0], cameraCenterXDD[1]];
     let requestedOrbitCenterYDD: DoubleDouble = [cameraCenterYDD[0], cameraCenterYDD[1]];
     let requestedOrbitZoom = cameraZoom;
     let requestedOrbitModeBlend = 0;
+    let requestedOrbitCRe = 0.285;
+    let requestedOrbitCIm = 0.01;
+    let requestedOrbitZ0Re = 0;
+    let requestedOrbitZ0Im = 0;
+    let requestedOrbitExponent = 2;
     let cameraVersion = 0;
     let activeOrbitVersion = -1;
     const requestVersionById = new Map<number, number>();
@@ -686,6 +697,11 @@ async function init() {
         centerY: number;
         zoom: number;
         modeBlend: number;
+        cRe: number;
+        cIm: number;
+        z0Re: number;
+        z0Im: number;
+        exponent: number;
         length: number;
         orbit: Float32Array;
         usedAt: number;
@@ -713,6 +729,11 @@ async function init() {
         lastOrbitCenterYDD = ddFromNumber(centerY);
         lastOrbitZoom = zoom;
         lastOrbitModeBlend = modeBlend;
+        lastOrbitCRe = uniforms.uC[0];
+        lastOrbitCIm = uniforms.uC[1];
+        lastOrbitZ0Re = uniforms.uZ0[0];
+        lastOrbitZ0Im = uniforms.uZ0[1];
+        lastOrbitExponent = exponent;
         activeOrbitVersion = version;
     };
 
@@ -733,6 +754,7 @@ async function init() {
         uCenterRefOffsetX: new Float32Array(splitDouble(0)),
         uCenterRefOffsetY: new Float32Array(splitDouble(0)),
         uPerturbDcCoeff: 1,
+        uPerturbDz0Coeff: 0,
         uTime: 0,
         uC: new Float32Array([0.285, 0.01]),
         uZ0: new Float32Array([0, 0]),
@@ -1042,6 +1064,10 @@ async function init() {
         const version = requestVersionById.get(id);
         requestVersionById.delete(id);
         if (version === undefined || version !== cameraVersion) return;
+        const paramsMatch = Math.abs(uniforms.uC[0] - requestedOrbitCRe) + Math.abs(uniforms.uC[1] - requestedOrbitCIm)
+            + Math.abs(uniforms.uZ0[0] - requestedOrbitZ0Re) + Math.abs(uniforms.uZ0[1] - requestedOrbitZ0Im)
+            + Math.abs(exponent - requestedOrbitExponent) < 1e-9;
+        if (!paramsMatch) return;
 
         latestAppliedOrbitId = id;
         const requestedOrbitCenterX = ddToNumber(requestedOrbitCenterXDD);
@@ -1054,6 +1080,11 @@ async function init() {
             centerY: requestedOrbitCenterY,
             zoom: requestedOrbitZoom,
             modeBlend: requestedOrbitModeBlend,
+            cRe: requestedOrbitCRe,
+            cIm: requestedOrbitCIm,
+            z0Re: requestedOrbitZ0Re,
+            z0Im: requestedOrbitZ0Im,
+            exponent: requestedOrbitExponent,
             length: Math.min(length, ORBIT_CAPACITY),
             orbit: new Float32Array(orbit.subarray(0, length * ORBIT_FLOATS_PER_POINT)),
             usedAt: performance.now(),
@@ -1104,6 +1135,7 @@ async function init() {
         gl.uniform2fv(getLoc('uCenterRefOffsetX'), uniforms.uCenterRefOffsetX);
         gl.uniform2fv(getLoc('uCenterRefOffsetY'), uniforms.uCenterRefOffsetY);
         gl.uniform1f(getLoc('uPerturbDcCoeff'), uniforms.uPerturbDcCoeff);
+        gl.uniform1f(getLoc('uPerturbDz0Coeff'), uniforms.uPerturbDz0Coeff);
         gl.uniform1f(getLoc('uTime'), uniforms.uTime);
         gl.uniform2fv(getLoc('uC'), uniforms.uC);
         gl.uniform2fv(getLoc('uZ0'), uniforms.uZ0);
@@ -1282,13 +1314,19 @@ async function init() {
         );
         const orbitZoomDeltaRaw = Math.abs(Math.log2(Math.max(1e-12, zoom / lastOrbitZoom)));
         const orbitModeBlendDelta = Math.abs(modeBlend - lastOrbitModeBlend);
-        const orbitStaleRaw = orbitDriftPxRaw > 48 || orbitZoomDeltaRaw > 0.3 || orbitModeBlendDelta > 0.02;
+        const orbitParamDelta = Math.abs(uniforms.uC[0] - lastOrbitCRe) + Math.abs(uniforms.uC[1] - lastOrbitCIm)
+            + Math.abs(uniforms.uZ0[0] - lastOrbitZ0Re) + Math.abs(uniforms.uZ0[1] - lastOrbitZ0Im)
+            + Math.abs(exponent - lastOrbitExponent);
+        const orbitStaleRaw = orbitDriftPxRaw > 48 || orbitZoomDeltaRaw > 0.3 || orbitModeBlendDelta > 0.02 || orbitParamDelta > 1e-9;
 
         if ((orbitStaleRaw || refLength === 0) && activeOrbitVersion !== cameraVersion) {
             let best: (typeof orbitCache)[number] | null = null;
             let bestScore = Number.POSITIVE_INFINITY;
             for (const entry of orbitCache) {
                 if (Math.abs(entry.modeBlend - modeBlend) > 0.02) continue;
+                if (Math.abs(entry.cRe - uniforms.uC[0]) + Math.abs(entry.cIm - uniforms.uC[1]) > 1e-9) continue;
+                if (Math.abs(entry.z0Re - uniforms.uZ0[0]) + Math.abs(entry.z0Im - uniforms.uZ0[1]) > 1e-9) continue;
+                if (Math.abs(entry.exponent - exponent) > 0.01) continue;
                 const driftPx = Math.hypot(
                     (cameraCenterX - entry.centerX) * zoom,
                     (cameraCenterY - entry.centerY) * zoom,
@@ -1313,9 +1351,12 @@ async function init() {
             (cameraCenterY - lastOrbitCenterY) * zoom,
         );
         const orbitZoomDelta = Math.abs(Math.log2(Math.max(1e-12, zoom / lastOrbitZoom)));
-        const orbitStale = orbitDriftPx > 48 || orbitZoomDelta > 0.3 || Math.abs(modeBlend - lastOrbitModeBlend) > 0.02;
+        const orbitParamStale = Math.abs(uniforms.uC[0] - lastOrbitCRe) + Math.abs(uniforms.uC[1] - lastOrbitCIm)
+            + Math.abs(uniforms.uZ0[0] - lastOrbitZ0Re) + Math.abs(uniforms.uZ0[1] - lastOrbitZ0Im)
+            + Math.abs(exponent - lastOrbitExponent) > 1e-9;
+        const orbitStale = orbitDriftPx > 48 || orbitZoomDelta > 0.3 || Math.abs(modeBlend - lastOrbitModeBlend) > 0.02 || orbitParamStale;
 
-        const usePerturb = refLength > 0 && zoom > 2e5;
+        const usePerturb = refLength > 0 && zoom > 2e5 && Math.abs(exponent - 2) < 0.01;
         const perturbTarget = usePerturb
             ? (orbitStale ? (activelyInteracting ? 0.6 : 0.15) : 1.0)
             : 0.0;
@@ -1324,6 +1365,7 @@ async function init() {
         uniforms.uUsePerturb = usePerturb ? 1 : 0;
         uniforms.uPerturbBlend = smoothedPerturbBlend;
         uniforms.uPerturbDcCoeff = 1 - modeBlend;
+        uniforms.uPerturbDz0Coeff = modeBlend;
         if (usePerturb) {
             const [offXHi, offXLo] = ddSub(cameraCenterXDD, lastOrbitCenterXDD);
             const [offYHi, offYLo] = ddSub(cameraCenterYDD, lastOrbitCenterYDD);
@@ -1344,6 +1386,11 @@ async function init() {
             requestedOrbitCenterYDD = [cameraCenterYDD[0], cameraCenterYDD[1]];
             requestedOrbitZoom = zoom;
             requestedOrbitModeBlend = modeBlend;
+            requestedOrbitCRe = uniforms.uC[0];
+            requestedOrbitCIm = uniforms.uC[1];
+            requestedOrbitZ0Re = uniforms.uZ0[0];
+            requestedOrbitZ0Im = uniforms.uZ0[1];
+            requestedOrbitExponent = exponent;
             const reqXHi = cameraCenterXDD[0];
             const reqXLo = cameraCenterXDD[1];
             const reqYHi = cameraCenterYDD[0];
@@ -1368,6 +1415,9 @@ async function init() {
                 modeBlend: modeBlend,
                 cReal: uniforms.uC[0],
                 cImag: uniforms.uC[1],
+                z0Real: uniforms.uZ0[0],
+                z0Imag: uniforms.uZ0[1],
+                exponent,
             });
         }
 
@@ -1431,7 +1481,12 @@ async function init() {
     requestAnimationFrame(tick);
 
     window.addEventListener('resize', () => {
+        const oldMin = Math.min(canvas.width, canvas.height);
         resize();
+        const newMin = Math.min(canvas.width, canvas.height);
+        if (oldMin > 0 && newMin > 0 && oldMin !== newMin) {
+            cameraZoom *= newMin / oldMin;
+        }
         cameraVersion += 1;
         activeOrbitVersion = -1;
     });

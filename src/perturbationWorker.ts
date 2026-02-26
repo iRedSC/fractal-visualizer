@@ -12,6 +12,9 @@ type OrbitRequest = {
     modeBlend?: number;
     cReal?: number;
     cImag?: number;
+    z0Real?: number;
+    z0Imag?: number;
+    exponent?: number;
 };
 
 type OrbitResponse = {
@@ -38,14 +41,30 @@ self.onmessage = (event: MessageEvent<OrbitRequest>) => {
     const blend = req.modeBlend ?? 0;
     const cRe = req.cReal ?? 0;
     const cIm = req.cImag ?? 0;
+    const z0Re = req.z0Real ?? 0;
+    const z0Im = req.z0Imag ?? 0;
+    const exponent = req.exponent ?? 2;
+
+    const complexPow = (x: Decimal, y: Decimal, p: number): { re: Decimal; im: Decimal } => {
+        const r2 = x.mul(x).plus(y.mul(y));
+        if (r2.lte(0)) return { re: new Decimal(0), im: new Decimal(0) };
+        const r = r2.sqrt();
+        const theta = Math.atan2(y.toNumber(), x.toNumber());
+        const rp = r.pow(p);
+        const pTheta = theta * p;
+        return {
+            re: rp.mul(Math.cos(pTheta)),
+            im: rp.mul(Math.sin(pTheta)),
+        };
+    };
 
     let zr: Decimal;
     let zi: Decimal;
     let cx: Decimal;
     let cy: Decimal;
     if (mode === 'mandelbrot') {
-        zr = new Decimal(0);
-        zi = new Decimal(0);
+        zr = new Decimal(z0Re);
+        zi = new Decimal(z0Im);
         cx = centerX;
         cy = centerY;
     } else if (mode === 'julia') {
@@ -74,15 +93,14 @@ self.onmessage = (event: MessageEvent<OrbitRequest>) => {
         out[i * 4 + 3] = imLo;
         length = i + 1;
 
-        const zr2 = zr.mul(zr);
-        const zi2 = zi.mul(zi);
-        const nextZr = zr2.minus(zi2).plus(cx);
-        const nextZi = zr.mul(zi).mul(2).plus(cy);
+        const zp = complexPow(zr, zi, exponent);
+        const nextZr = zp.re.plus(cx);
+        const nextZi = zp.im.plus(cy);
 
         zr = nextZr;
         zi = nextZi;
 
-        if (zr2.plus(zi2).greaterThan(16)) break;
+        if (zr.mul(zr).plus(zi.mul(zi)).greaterThan(16)) break;
     }
 
     const response: OrbitResponse = {
