@@ -17,8 +17,6 @@
     "vite": "^7.3.1"
   },
   "dependencies": {
-    "decimal.js": "^10.6.0",
-    "pixi-viewport": "^6.0.3",
-    "pixi.js": "^8.16.0"
+    "decimal.js": "^10.6.0"
   }
 }

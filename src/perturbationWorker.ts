@@ -16,21 +16,36 @@ type OrbitResponse = {
     orbit: Float32Array;
 };
 
+/** Split a number into hi+lo double-double for GPU precision */
+function splitDouble(value: number): [number, number] {
+    const hi = Math.fround(value);
+    return [hi, value - hi];
+}
+
 self.onmessage = (event: MessageEvent<OrbitRequest>) => {
     const req = event.data;
-    Decimal.set({ precision: req.precisionDigits, rounding: Decimal.ROUND_HALF_EVEN });
+    const minPrecisionFromIterations = Math.ceil(Math.log2(Math.max(2, req.maxIterations + 1))) * 14;
+    const precision = Math.min(512, Math.max(req.precisionDigits, minPrecisionFromIterations));
+    Decimal.set({ precision, rounding: Decimal.ROUND_HALF_EVEN });
 
     const cx = new Decimal(req.centerXHi).plus(req.centerXLo);
     const cy = new Decimal(req.centerYHi).plus(req.centerYLo);
 
-    const out = new Float32Array(req.maxIterations * 2);
+    // Output as double-double: 4 floats per point [re_hi, re_lo, im_hi, im_lo]
+    const out = new Float32Array(req.maxIterations * 4);
     let zr = new Decimal(0);
     let zi = new Decimal(0);
     let length = 0;
 
     for (let i = 0; i < req.maxIterations; i += 1) {
-        out[i * 2] = zr.toNumber();
-        out[i * 2 + 1] = zi.toNumber();
+        const re = zr.toNumber();
+        const im = zi.toNumber();
+        const [reHi, reLo] = splitDouble(re);
+        const [imHi, imLo] = splitDouble(im);
+        out[i * 4] = reHi;
+        out[i * 4 + 1] = reLo;
+        out[i * 4 + 2] = imHi;
+        out[i * 4 + 3] = imLo;
         length = i + 1;
 
         const zr2 = zr.mul(zr);
@@ -47,7 +62,7 @@ self.onmessage = (event: MessageEvent<OrbitRequest>) => {
     const response: OrbitResponse = {
         id: req.id,
         length,
-        orbit: out.subarray(0, length * 2),
+        orbit: out.subarray(0, length * 4),
     };
 
     postMessage(response);

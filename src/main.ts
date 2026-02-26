@@ -1,15 +1,15 @@
-import { Application, Geometry, Mesh, Shader, GlProgram, UniformGroup } from 'pixi.js';
-import { Viewport } from 'pixi-viewport';
 import './style.css';
 
-const ORBIT_CAPACITY = 256;
+const ORBIT_CAPACITY = 1024;
+const ORBIT_FLOATS_PER_POINT = 4;
 const ORBIT_CACHE_LIMIT = 12;
 const TARGET_FPS = 58;
 const QUALITY_MIN = 0.35;
 const QUALITY_MAX = 2.2;
 const INTERACTION_RECALC_DEBOUNCE_MS = 48;
+const WHEEL_ZOOM_FACTOR = 1.08;
 
-const vertexSrc = `
+const vertexSrc = `#version 300 es
     in vec2 aPosition;
     out vec2 vPosition;
 
@@ -19,7 +19,7 @@ const vertexSrc = `
     }
 `;
 
-const fragmentSrc = `
+const fragmentSrc = `#version 300 es
     precision highp float;
 
     in vec2 vPosition;
@@ -38,7 +38,9 @@ const fragmentSrc = `
     uniform int uRefLength;
     uniform vec2 uRefCenterX;
     uniform vec2 uRefCenterY;
-    uniform vec2 uRefOrbit[256];
+    uniform sampler2D uRefOrbitTex;
+    uniform vec2 uCenterRefOffsetX;
+    uniform vec2 uCenterRefOffsetY;
     uniform float uTime;
     uniform vec2 uC;
     uniform vec2 uZ0;
@@ -284,34 +286,98 @@ const fragmentSrc = `
         return vec2(a.x * b.x - a.y * b.y, a.x * b.y + a.y * b.x);
     }
 
-    float mandelbrotSmoothPerturb(vec2 dc, vec4 cFull, float maxIter) {
+    vec4 dsComplexAdd(vec4 a, vec4 b) {
+        vec2 re = dsAdd(a.xy, b.xy);
+        vec2 im = dsAdd(a.zw, b.zw);
+        return vec4(re, im);
+    }
+
+    vec4 dsComplexMul(vec4 a, vec4 b) {
+        vec2 re = dsSub(dsMul(a.xy, b.xy), dsMul(a.zw, b.zw));
+        vec2 im = dsAdd(dsMul(a.xy, b.zw), dsMul(a.zw, b.xy));
+        return vec4(re, im);
+    }
+
+    vec4 dsComplexScale(vec4 z, float s) {
+        vec2 re = dsMulFloat(z.xy, s);
+        vec2 im = dsMulFloat(z.zw, s);
+        return vec4(re, im);
+    }
+
+    float dsComplexMag2(vec4 z) {
+        vec2 re2 = dsMul(z.xy, z.xy);
+        vec2 im2 = dsMul(z.zw, z.zw);
+        vec2 mag2 = dsAdd(re2, im2);
+        return mag2.x + mag2.y;
+    }
+
+    float mandelbrotSmoothPerturb(vec4 dcFull, vec4 cFull, float maxIter) {
         int maxLimit = int(maxIter);
         if (maxLimit < 1) maxLimit = 1;
         if (maxLimit > uMaxIterations) maxLimit = uMaxIterations;
         int limit = uRefLength;
         if (maxLimit < limit) limit = maxLimit;
-        if (limit > 256) limit = 256;
-        vec2 dz = vec2(0.0);
+        if (limit > 1024) limit = 1024;
+        vec4 dz = vec4(0.0);
         float iter = 0.0;
-        vec2 z = vec2(0.0);
+        vec4 z = vec4(0.0);
+        bool needFullPrecision = false;
 
-        for (int i = 0; i < 256; i++) {
+        for (int i = 0; i < 1024; i++) {
             if (i >= limit) break;
-            vec2 Z = uRefOrbit[i];
-            z = Z + dz;
-            float mag2 = dot(z, z);
+            vec4 Zi = texelFetch(uRefOrbitTex, ivec2(i, 0), 0);
+            z = dsComplexAdd(Zi, dz);
+            float mag2 = dsComplexMag2(z);
             if (mag2 > 4.0) {
                 float safeMag2 = max(mag2, 4.000001);
                 return iter + 1.0 - log2(log2(safeMag2));
             }
-            vec2 twoZdz = 2.0 * complexMul(Z, dz);
-            vec2 dz2 = complexMul(dz, dz);
-            dz = twoZdz + dz2 + dc;
+            float dzMag2 = dsComplexMag2(dz);
+            float ZMag2 = dsComplexMag2(Zi);
+            if (dzMag2 > ZMag2) {
+                needFullPrecision = true;
+                break;
+            }
+            float dzMag = sqrt(dzMag2);
+            if (dzMag > 1e-30 && mag2 < dzMag2 * 1e-20) {
+                needFullPrecision = true;
+                break;
+            }
+            vec4 twoZdz = dsComplexScale(dsComplexMul(Zi, dz), 2.0);
+            vec4 dz2 = dsComplexMul(dz, dz);
+            dz = dsComplexAdd(dsComplexAdd(twoZdz, dz2), dcFull);
             iter += 1.0;
         }
 
-        vec2 zx = vec2(z.x, 0.0);
-        vec2 zy = vec2(z.y, 0.0);
+        if (needFullPrecision) {
+            vec2 zx = z.xy;
+            vec2 zy = z.zw;
+            vec2 cx = cFull.xy;
+            vec2 cy = cFull.zw;
+            int remaining = maxLimit - int(iter);
+            for (int i = 0; i < 4096; i++) {
+                if (i >= remaining) break;
+                vec2 zx2 = dsMul(zx, zx);
+                vec2 zy2 = dsMul(zy, zy);
+                vec2 zxy = dsMul(zx, zy);
+                vec2 nx = dsAdd(dsSub(zx2, zy2), cx);
+                vec2 ny = dsAdd(dsMulFloat(zxy, 2.0), cy);
+                float x = nx.x + nx.y;
+                float y = ny.x + ny.y;
+                float mag2 = x * x + y * y;
+                if (mag2 > 4.0) {
+                    float safeMag2 = max(mag2, 4.000001);
+                    return iter + 1.0 - log2(log2(safeMag2));
+                }
+                zx = nx;
+                zy = ny;
+                iter += 1.0;
+            }
+            return -1.0;
+        }
+
+        vec2 zx = z.xy;
+        vec2 zy = z.zw;
         vec2 cx = cFull.xy;
         vec2 cy = cFull.zw;
 
@@ -339,76 +405,185 @@ const fragmentSrc = `
     vec3 sampleColorAtPixel(vec2 pixelPos, float maxIter) {
         vec4 pixelPosDS = pixelToComplexDS(pixelPos);
         vec2 pixelC = vec2(pixelPosDS.x + pixelPosDS.y, pixelPosDS.z + pixelPosDS.w);
+        vec4 cFull;
+        vec4 z0Full;
         float sDirect;
         if (uModeBlend <= 0.001) {
+            z0Full = vec4(uZ0.x, 0.0, uZ0.y, 0.0);
+            cFull = pixelPosDS;
             sDirect = uPrecisionMode == 0
                 ? iterSmooth(uZ0, pixelC, maxIter)
-                : iterSmoothDS(vec4(uZ0.x, 0.0, uZ0.y, 0.0), pixelPosDS, maxIter);
+                : iterSmoothDS(z0Full, cFull, maxIter);
         } else if (uModeBlend >= 0.999) {
+            z0Full = pixelPosDS;
+            cFull = vec4(uC.x, 0.0, uC.y, 0.0);
             sDirect = uPrecisionMode == 0
                 ? juliaSmooth(pixelC, maxIter)
-                : juliaSmoothDS(pixelPosDS, maxIter);
+                : juliaSmoothDS(z0Full, maxIter);
         } else {
             vec2 z0 = uModeBlend * pixelC;
             vec2 c = (1.0 - uModeBlend) * pixelC + uModeBlend * uC;
-            sDirect = iterSmooth(z0, c, maxIter);
+            vec2 z0x = dsMulFloat(pixelPosDS.xy, uModeBlend);
+            vec2 z0y = dsMulFloat(pixelPosDS.zw, uModeBlend);
+            vec2 cMixX = dsMulFloat(pixelPosDS.xy, 1.0 - uModeBlend);
+            vec2 cMixY = dsMulFloat(pixelPosDS.zw, 1.0 - uModeBlend);
+            vec2 cDSX = dsAdd(cMixX, vec2(uModeBlend * uC.x, 0.0));
+            vec2 cDSY = dsAdd(cMixY, vec2(uModeBlend * uC.y, 0.0));
+            z0Full = vec4(z0x.x, z0x.y, z0y.x, z0y.y);
+            cFull = vec4(cDSX.x, cDSX.y, cDSY.x, cDSY.y);
+            sDirect = uPrecisionMode == 0
+                ? iterSmooth(z0, c, maxIter)
+                : iterSmoothDS(z0Full, cFull, maxIter);
         }
 
         float s = sDirect;
         if (uModeBlend <= 0.001 && uUsePerturb == 1 && uRefLength > 0) {
-            vec2 dcx = dsSub(pixelPosDS.xy, uRefCenterX);
-            vec2 dcy = dsSub(pixelPosDS.zw, uRefCenterY);
-            vec2 dc = vec2(dcx.x + dcx.y, dcy.x + dcy.y);
+            float dx = pixelPos.x - uResolution.x * 0.5;
+            float dy = uResolution.y * 0.5 - pixelPos.y;
+            vec2 dcx = dsAdd(uCenterRefOffsetX, dsMulFloat(uInvZoom, dx));
+            vec2 dcy = dsAdd(uCenterRefOffsetY, dsMulFloat(uInvZoom, dy));
+            vec4 dc = vec4(dcx.x, dcx.y, dcy.x, dcy.y);
             float sPerturb = mandelbrotSmoothPerturb(dc, pixelPosDS, maxIter);
             s = mix(sDirect, sPerturb, uPerturbBlend);
         }
         return colorFromSmooth(s);
     }
 
+    vec2 clampToViewport(vec2 pixelPos) {
+        vec2 maxPixel = max(vec2(0.0), uResolution - vec2(1.0));
+        return clamp(pixelPos, vec2(0.0), maxPixel);
+    }
+
     void main() {
         vec2 screenPos = vPosition * 0.5 + 0.5;
         screenPos.y = 1.0 - screenPos.y;
-        vec2 pixelPos = screenPos * uResolution;
+        vec2 pixelPos = clampToViewport(screenPos * uResolution);
         float maxIter = float(uMaxIterations);
         vec3 color = sampleColorAtPixel(pixelPos, maxIter);
 
         if (uLod >= 1) {
             float j = 0.5;
-            vec3 a = sampleColorAtPixel(pixelPos + vec2( j,  j), maxIter);
-            vec3 b = sampleColorAtPixel(pixelPos + vec2(-j,  j), maxIter);
-            vec3 c = sampleColorAtPixel(pixelPos + vec2( j, -j), maxIter);
-            vec3 d = sampleColorAtPixel(pixelPos + vec2(-j, -j), maxIter);
+            vec3 a = sampleColorAtPixel(clampToViewport(pixelPos + vec2( j,  j)), maxIter);
+            vec3 b = sampleColorAtPixel(clampToViewport(pixelPos + vec2(-j,  j)), maxIter);
+            vec3 c = sampleColorAtPixel(clampToViewport(pixelPos + vec2( j, -j)), maxIter);
+            vec3 d = sampleColorAtPixel(clampToViewport(pixelPos + vec2(-j, -j)), maxIter);
             color = (a + b + c + d) * 0.25;
         }
         if (uLod >= 2 && uPrecisionMode == 0) {
             float j2 = 0.6;
-            vec3 d = sampleColorAtPixel(pixelPos + vec2(-j2, -j2), maxIter);
-            vec3 e = sampleColorAtPixel(pixelPos + vec2( 0.0, -j2), maxIter);
-            vec3 f = sampleColorAtPixel(pixelPos + vec2( j2,  0.0), maxIter);
-            vec3 g = sampleColorAtPixel(pixelPos + vec2( 0.0,  j2), maxIter);
-            vec3 h = sampleColorAtPixel(pixelPos + vec2(-j2,  0.0), maxIter);
+            vec3 d = sampleColorAtPixel(clampToViewport(pixelPos + vec2(-j2, -j2)), maxIter);
+            vec3 e = sampleColorAtPixel(clampToViewport(pixelPos + vec2( 0.0, -j2)), maxIter);
+            vec3 f = sampleColorAtPixel(clampToViewport(pixelPos + vec2( j2,  0.0)), maxIter);
+            vec3 g = sampleColorAtPixel(clampToViewport(pixelPos + vec2( 0.0,  j2)), maxIter);
+            vec3 h = sampleColorAtPixel(clampToViewport(pixelPos + vec2(-j2,  0.0)), maxIter);
             color = (color * 4.0 + d + e + f + g + h) / 9.0;
         }
         finalColor = vec4(color, 1.0);
     }
 `;
 
+function compileShader(gl: WebGL2RenderingContext, type: number, source: string): WebGLShader {
+    const shader = gl.createShader(type)!;
+    gl.shaderSource(shader, source);
+    gl.compileShader(shader);
+    if (!gl.getShaderParameter(shader, gl.COMPILE_STATUS)) {
+        const log = gl.getShaderInfoLog(shader);
+        gl.deleteShader(shader);
+        throw new Error(`Shader compile error: ${log}`);
+    }
+    return shader;
+}
+
+function createProgram(gl: WebGL2RenderingContext): WebGLProgram {
+    const vs = compileShader(gl, gl.VERTEX_SHADER, vertexSrc);
+    const fs = compileShader(gl, gl.FRAGMENT_SHADER, fragmentSrc);
+    const program = gl.createProgram()!;
+    gl.attachShader(program, vs);
+    gl.attachShader(program, fs);
+    gl.linkProgram(program);
+    gl.deleteShader(vs);
+    gl.deleteShader(fs);
+    if (!gl.getProgramParameter(program, gl.LINK_STATUS)) {
+        const log = gl.getProgramInfoLog(program);
+        gl.deleteProgram(program);
+        throw new Error(`Program link error: ${log}`);
+    }
+    return program;
+}
+
 async function init() {
+    type DoubleDouble = [number, number];
+
     const splitDouble = (value: number): [number, number] => {
         const hi = Math.fround(value);
         return [hi, value - hi];
     };
 
-    const app = new Application();
-    await app.init({
-        resizeTo: window,
-        autoDensity: true,
-        resolution: window.devicePixelRatio || 1,
-        preference: 'webgl',
-        backgroundColor: 0x000000,
-    });
+    const twoSum = (a: number, b: number): DoubleDouble => {
+        const s = a + b;
+        const bb = s - a;
+        const err = (a - (s - bb)) + (b - bb);
+        return [s, err];
+    };
 
-    document.getElementById('app')!.appendChild(app.canvas);
+    const ddAdd = (a: DoubleDouble, b: DoubleDouble): DoubleDouble => {
+        const s = twoSum(a[0], b[0]);
+        const e = a[1] + b[1] + s[1];
+        return twoSum(s[0], e);
+    };
+
+    const ddSub = (a: DoubleDouble, b: DoubleDouble): DoubleDouble => ddAdd(a, [-b[0], -b[1]]);
+
+    const ddFromNumber = (value: number): DoubleDouble => splitDouble(value);
+    const ddToNumber = (value: DoubleDouble): number => value[0] + value[1];
+
+    const canvas = document.createElement('canvas');
+    canvas.style.width = '100%';
+    canvas.style.height = '100%';
+    canvas.style.display = 'block';
+    canvas.style.touchAction = 'none';
+    document.getElementById('app')!.appendChild(canvas);
+
+    const gl = canvas.getContext('webgl2', {
+        alpha: false,
+        antialias: false,
+        powerPreference: 'high-performance',
+    });
+    if (!gl) throw new Error('WebGL2 not supported');
+
+    const program = createProgram(gl);
+    const positionLoc = gl.getAttribLocation(program, 'aPosition');
+
+    const orbitTex = gl.createTexture()!;
+    gl.bindTexture(gl.TEXTURE_2D, orbitTex);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA32F, ORBIT_CAPACITY, 1, 0, gl.RGBA, gl.FLOAT, null);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+
+    const positions = new Float32Array([-1, -1, 1, -1, 1, 1, -1, 1]);
+    const indices = new Uint16Array([0, 1, 2, 0, 2, 3]);
+    const vbo = gl.createBuffer();
+    gl.bindBuffer(gl.ARRAY_BUFFER, vbo);
+    gl.bufferData(gl.ARRAY_BUFFER, positions, gl.STATIC_DRAW);
+    const ebo = gl.createBuffer();
+    gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, ebo);
+    gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, indices, gl.STATIC_DRAW);
+
+    const resize = () => {
+        const dpr = window.devicePixelRatio || 1;
+        const w = Math.floor(window.innerWidth * dpr);
+        const h = Math.floor(window.innerHeight * dpr);
+        if (canvas.width !== w || canvas.height !== h) {
+            canvas.width = w;
+            canvas.height = h;
+            canvas.style.width = `${window.innerWidth}px`;
+            canvas.style.height = `${window.innerHeight}px`;
+            gl.viewport(0, 0, w, h);
+        }
+    };
+    resize();
 
     const controlsPanel = document.createElement('details');
     controlsPanel.className = 'hud-panel controls-panel';
@@ -483,14 +658,99 @@ async function init() {
         return (value - min) / (max - min);
     };
 
-    const viewport = new Viewport({
-        screenWidth: window.innerWidth,
-        screenHeight: window.innerHeight,
-        events: app.renderer.events,
-    });
+    const baseZoom = Math.min(window.innerWidth, window.innerHeight) / 3.5;
 
-    app.stage.addChild(viewport);
-    viewport.wheel().decelerate();
+    let cameraCenterXDD: DoubleDouble = ddFromNumber(-0.5);
+    let cameraCenterYDD: DoubleDouble = ddFromNumber(0);
+    let cameraZoom = baseZoom;
+    const perturbWorker = new Worker(new URL('./perturbationWorker.ts', import.meta.url), { type: 'module' });
+    let refLength = 0;
+    let refRequestId = 0;
+    let latestAppliedOrbitId = 0;
+    let pendingOrbitRequest = false;
+    let lastOrbitCenterXDD: DoubleDouble = [cameraCenterXDD[0], cameraCenterXDD[1]];
+    let lastOrbitCenterYDD: DoubleDouble = [cameraCenterYDD[0], cameraCenterYDD[1]];
+    let lastOrbitZoom = cameraZoom;
+    let requestedOrbitCenterXDD: DoubleDouble = [cameraCenterXDD[0], cameraCenterXDD[1]];
+    let requestedOrbitCenterYDD: DoubleDouble = [cameraCenterYDD[0], cameraCenterYDD[1]];
+    let requestedOrbitZoom = cameraZoom;
+    let cameraVersion = 0;
+    let activeOrbitVersion = -1;
+    const requestVersionById = new Map<number, number>();
+    const orbitCache: Array<{
+        centerX: number;
+        centerY: number;
+        zoom: number;
+        length: number;
+        orbit: Float32Array;
+        usedAt: number;
+    }> = [];
+
+    const applyOrbit = (
+        orbit: Float32Array,
+        length: number,
+        centerX: number,
+        centerY: number,
+        zoom: number,
+        version: number,
+    ) => {
+        refLength = Math.min(length, ORBIT_CAPACITY);
+        gl.bindTexture(gl.TEXTURE_2D, orbitTex);
+        gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, refLength, 1, gl.RGBA, gl.FLOAT, orbit);
+        uniforms.uRefLength = refLength;
+        const [refXHi, refXLo] = splitDouble(centerX);
+        const [refYHi, refYLo] = splitDouble(centerY);
+        uniforms.uRefCenterX[0] = refXHi;
+        uniforms.uRefCenterX[1] = refXLo;
+        uniforms.uRefCenterY[0] = refYHi;
+        uniforms.uRefCenterY[1] = refYLo;
+        lastOrbitCenterXDD = ddFromNumber(centerX);
+        lastOrbitCenterYDD = ddFromNumber(centerY);
+        lastOrbitZoom = zoom;
+        activeOrbitVersion = version;
+    };
+
+    const uniforms = {
+        uResolution: new Float32Array([window.innerWidth, window.innerHeight]),
+        uCenterX: new Float32Array([cameraCenterXDD[0], cameraCenterXDD[1]]),
+        uCenterY: new Float32Array([cameraCenterYDD[0], cameraCenterYDD[1]]),
+        uInvZoom: new Float32Array(splitDouble(1 / cameraZoom)),
+        uMaxIterations: 200,
+        uColorIterations: 320,
+        uLod: 0,
+        uPrecisionMode: 0,
+        uUsePerturb: 0,
+        uPerturbBlend: 0,
+        uRefLength: 0,
+        uRefCenterX: new Float32Array([cameraCenterXDD[0], cameraCenterXDD[1]]),
+        uRefCenterY: new Float32Array([cameraCenterYDD[0], cameraCenterYDD[1]]),
+        uCenterRefOffsetX: new Float32Array(splitDouble(0)),
+        uCenterRefOffsetY: new Float32Array(splitDouble(0)),
+        uTime: 0,
+        uC: new Float32Array([0.285, 0.01]),
+        uZ0: new Float32Array([0, 0]),
+        uModeBlend: 0,
+        uExponent: 2,
+    };
+
+    const getCanvasCoords = (clientX: number, clientY: number) => {
+        const rect = canvas.getBoundingClientRect();
+        const scaleX = canvas.width / rect.width;
+        const scaleY = canvas.height / rect.height;
+        return {
+            x: (clientX - rect.left) * scaleX,
+            y: (clientY - rect.top) * scaleY,
+        };
+    };
+
+    const isMobileDevice = window.matchMedia('(pointer: coarse)').matches
+        || navigator.maxTouchPoints > 0
+        || /Mobi|Android|iPhone|iPad|iPod/i.test(navigator.userAgent);
+    const getTouchDistance = (a: Touch, b: Touch) => Math.hypot(a.clientX - b.clientX, a.clientY - b.clientY);
+    const getTouchMidpoint = (a: Touch, b: Touch) => ({
+        x: (a.clientX + b.clientX) * 0.5,
+        y: (a.clientY + b.clientY) * 0.5,
+    });
 
     let mouseControlC: { real: number; imag: number } | null = null;
     let mouseControlZ0: { real: number; imag: number } | null = null;
@@ -504,27 +764,22 @@ async function init() {
         imag: number;
         isJulia: boolean;
     } | null = null;
-    let panStart: { x: number; y: number; centerX: number; centerY: number } | null = null;
+    let panStart: { x: number; y: number; centerX: DoubleDouble; centerY: DoubleDouble } | null = null;
     let blendDragStart: { x: number; y: number; blend: number; exponent: number } | null = null;
-    let modeBlend = 1;
+    let modeBlend = 0;
     let exponent = 2;
     let animationPaused = true;
+    let phaseOffsetCRe = 0;
+    let phaseOffsetCIm = 0;
+    let phaseOffsetZ0Re = 0;
+    let phaseOffsetZ0Im = 0;
+    let phaseOffsetBlend = 0;
+    let phaseOffsetExp = 0;
+    let lastFrameUsedFormulaC = false;
+    let lastFrameUsedFormulaZ0 = false;
+    let lastFrameUsedFormulaBlend = false;
     const blendSensitivity = 0.0015;
     const exponentSensitivity = 0.003;
-
-    const getCanvasCoords = (clientX: number, clientY: number) => {
-        const rect = app.canvas.getBoundingClientRect();
-        return { x: clientX - rect.left, y: clientY - rect.top };
-    };
-
-    const isMobileDevice = window.matchMedia('(pointer: coarse)').matches
-        || navigator.maxTouchPoints > 0
-        || /Mobi|Android|iPhone|iPad|iPod/i.test(navigator.userAgent);
-    const getTouchDistance = (a: Touch, b: Touch) => Math.hypot(a.clientX - b.clientX, a.clientY - b.clientY);
-    const getTouchMidpoint = (a: Touch, b: Touch) => ({
-        x: (a.clientX + b.clientX) * 0.5,
-        y: (a.clientY + b.clientY) * 0.5,
-    });
 
     let pinchStart: { distance: number; zoom: number } | null = null;
     let touchTwoFingerStart: { x: number; y: number; blend: number; exponent: number } | null = null;
@@ -541,11 +796,11 @@ async function init() {
                 const isJulia = modeBlend > 0.5;
                 const lim = isJulia ? cLimits : z0Limits;
                 const rawReal = isJulia
-                    ? (mouseControlC?.real ?? uniforms.uniforms.uC[0])
-                    : (mouseControlZ0?.real ?? uniforms.uniforms.uZ0[0]);
+                    ? (mouseControlC?.real ?? uniforms.uC[0])
+                    : (mouseControlZ0?.real ?? uniforms.uZ0[0]);
                 const rawImag = isJulia
-                    ? (mouseControlC?.imag ?? uniforms.uniforms.uC[1])
-                    : (mouseControlZ0?.imag ?? uniforms.uniforms.uZ0[1]);
+                    ? (mouseControlC?.imag ?? uniforms.uC[1])
+                    : (mouseControlZ0?.imag ?? uniforms.uZ0[1]);
                 const real = Math.max(lim.realMin, Math.min(lim.realMax, rawReal));
                 const imag = Math.max(lim.imagMin, Math.min(lim.imagMax, rawImag));
                 dragStart = { x, y, real, imag, isJulia };
@@ -557,7 +812,12 @@ async function init() {
                 animationPaused = true;
             }
         } else if (e.button === 1) {
-            panStart = { x, y, centerX: cameraCenterX, centerY: cameraCenterY };
+            panStart = {
+                x,
+                y,
+                centerX: [cameraCenterXDD[0], cameraCenterXDD[1]],
+                centerY: [cameraCenterYDD[0], cameraCenterYDD[1]],
+            };
             animationPaused = true;
         } else if (e.button === 2) {
             blendDragStart = { x, y, blend: modeBlend, exponent };
@@ -587,8 +847,8 @@ async function init() {
         } else if ((e.buttons & 4) && panStart) {
             const dx = x - panStart.x;
             const dy = y - panStart.y;
-            cameraCenterX = panStart.centerX - dx / cameraZoom;
-            cameraCenterY = panStart.centerY + dy / cameraZoom;
+            cameraCenterXDD = ddAdd(panStart.centerX, ddFromNumber(-dx / cameraZoom));
+            cameraCenterYDD = ddAdd(panStart.centerY, ddFromNumber(dy / cameraZoom));
             lastInteractionAt = performance.now();
             cameraVersion += 1;
             activeOrbitVersion = -1;
@@ -611,6 +871,26 @@ async function init() {
         panStart = null;
     };
 
+    const onWheel = (e: WheelEvent) => {
+        e.preventDefault();
+        const { x, y } = getCanvasCoords(e.clientX, e.clientY);
+        const resX = canvas.width;
+        const resY = canvas.height;
+        const dx = x - resX * 0.5;
+        const dy = resY * 0.5 - y;
+        const zoomFactor = e.deltaY > 0 ? 1 / WHEEL_ZOOM_FACTOR : WHEEL_ZOOM_FACTOR;
+        const k = Math.pow(zoomFactor, Math.min(3, Math.abs(e.deltaY) / 50));
+        const newZoom = Math.max(1e-3, Math.min(Number.MAX_VALUE, cameraZoom * k));
+        const invZoom = 1 / cameraZoom;
+        const invNewZoom = 1 / newZoom;
+        cameraCenterXDD = ddAdd(cameraCenterXDD, ddFromNumber(dx * (invZoom - invNewZoom)));
+        cameraCenterYDD = ddAdd(cameraCenterYDD, ddFromNumber(dy * (invZoom - invNewZoom)));
+        cameraZoom = newZoom;
+        lastInteractionAt = performance.now();
+        cameraVersion += 1;
+        activeOrbitVersion = -1;
+    };
+
     const onTouchStart = (e: TouchEvent) => {
         if (!isMobileDevice) return;
         if (e.touches.length === 1) {
@@ -619,11 +899,11 @@ async function init() {
             const isJulia = modeBlend > 0.5;
             const lim = isJulia ? cLimits : z0Limits;
             const rawReal = isJulia
-                ? (mouseControlC?.real ?? uniforms.uniforms.uC[0])
-                : (mouseControlZ0?.real ?? uniforms.uniforms.uZ0[0]);
+                ? (mouseControlC?.real ?? uniforms.uC[0])
+                : (mouseControlZ0?.real ?? uniforms.uZ0[0]);
             const rawImag = isJulia
-                ? (mouseControlC?.imag ?? uniforms.uniforms.uC[1])
-                : (mouseControlZ0?.imag ?? uniforms.uniforms.uZ0[1]);
+                ? (mouseControlC?.imag ?? uniforms.uC[1])
+                : (mouseControlZ0?.imag ?? uniforms.uZ0[1]);
             const real = Math.max(lim.realMin, Math.min(lim.realMax, rawReal));
             const imag = Math.max(lim.imagMin, Math.min(lim.imagMax, rawImag));
             dragStart = { x, y, real, imag, isJulia };
@@ -718,11 +998,11 @@ async function init() {
             const isJulia = modeBlend > 0.5;
             const lim = isJulia ? cLimits : z0Limits;
             const rawReal = isJulia
-                ? (mouseControlC?.real ?? uniforms.uniforms.uC[0])
-                : (mouseControlZ0?.real ?? uniforms.uniforms.uZ0[0]);
+                ? (mouseControlC?.real ?? uniforms.uC[0])
+                : (mouseControlZ0?.real ?? uniforms.uZ0[0]);
             const rawImag = isJulia
-                ? (mouseControlC?.imag ?? uniforms.uniforms.uC[1])
-                : (mouseControlZ0?.imag ?? uniforms.uniforms.uZ0[1]);
+                ? (mouseControlC?.imag ?? uniforms.uC[1])
+                : (mouseControlZ0?.imag ?? uniforms.uZ0[1]);
             const real = Math.max(lim.realMin, Math.min(lim.realMax, rawReal));
             const imag = Math.max(lim.imagMin, Math.min(lim.imagMax, rawImag));
             dragStart = { x, y, real, imag, isJulia };
@@ -730,15 +1010,16 @@ async function init() {
         e.preventDefault();
     };
 
-    app.canvas.addEventListener('pointerdown', onPointerDown);
-    app.canvas.addEventListener('pointermove', onPointerMove);
-    app.canvas.addEventListener('pointerup', onPointerUp);
-    app.canvas.addEventListener('pointerleave', onPointerLeave);
-    app.canvas.addEventListener('contextmenu', (e) => e.preventDefault());
-    app.canvas.addEventListener('touchstart', onTouchStart, { passive: false });
-    app.canvas.addEventListener('touchmove', onTouchMove, { passive: false });
-    app.canvas.addEventListener('touchend', onTouchEnd, { passive: false });
-    app.canvas.addEventListener('touchcancel', onTouchEnd, { passive: false });
+    canvas.addEventListener('pointerdown', onPointerDown);
+    canvas.addEventListener('pointermove', onPointerMove);
+    canvas.addEventListener('pointerup', onPointerUp);
+    canvas.addEventListener('pointerleave', onPointerLeave);
+    canvas.addEventListener('wheel', onWheel, { passive: false });
+    canvas.addEventListener('contextmenu', (e) => e.preventDefault());
+    canvas.addEventListener('touchstart', onTouchStart, { passive: false });
+    canvas.addEventListener('touchmove', onTouchMove, { passive: false });
+    canvas.addEventListener('touchend', onTouchEnd, { passive: false });
+    canvas.addEventListener('touchcancel', onTouchEnd, { passive: false });
 
     window.addEventListener('keydown', (e: KeyboardEvent) => {
         if (e.code === 'Space') {
@@ -746,93 +1027,6 @@ async function init() {
             animationPaused = !animationPaused;
         }
     });
-
-    const geometry = new Geometry({
-        attributes: { aPosition: [-1, -1, 1, -1, 1, 1, -1, 1] },
-        indexBuffer: [0, 1, 2, 0, 2, 3],
-    });
-
-    const baseZoom = Math.min(window.innerWidth, window.innerHeight) / 3.5;
-    viewport.moveCenter(0, 0);
-    viewport.scaled = 1;
-
-    let cameraCenterX = -0.5;
-    let cameraCenterY = 0;
-    let cameraZoom = baseZoom;
-    const perturbWorker = new Worker(new URL('./perturbationWorker.ts', import.meta.url), { type: 'module' });
-    const refOrbit = new Float32Array(ORBIT_CAPACITY * 2);
-    let refLength = 0;
-    let refRequestId = 0;
-    let latestAppliedOrbitId = 0;
-    let pendingOrbitRequest = false;
-    let lastOrbitCenterX = cameraCenterX;
-    let lastOrbitCenterY = cameraCenterY;
-    let lastOrbitZoom = cameraZoom;
-    let cameraVersion = 0;
-    let activeOrbitVersion = -1;
-    const requestVersionById = new Map<number, number>();
-    const orbitCache: Array<{
-        centerX: number;
-        centerY: number;
-        zoom: number;
-        length: number;
-        orbit: Float32Array;
-        usedAt: number;
-    }> = [];
-
-    const applyOrbit = (
-        orbit: Float32Array,
-        length: number,
-        centerX: number,
-        centerY: number,
-        zoom: number,
-        version: number,
-    ) => {
-        refLength = Math.min(length, ORBIT_CAPACITY);
-        refOrbit.fill(0);
-        refOrbit.set(orbit.subarray(0, refLength * 2), 0);
-        uniforms.uniforms.uRefLength = refLength;
-        const [refXHi, refXLo] = splitDouble(centerX);
-        const [refYHi, refYLo] = splitDouble(centerY);
-        uniforms.uniforms.uRefCenterX[0] = refXHi;
-        uniforms.uniforms.uRefCenterX[1] = refXLo;
-        uniforms.uniforms.uRefCenterY[0] = refYHi;
-        uniforms.uniforms.uRefCenterY[1] = refYLo;
-        lastOrbitCenterX = centerX;
-        lastOrbitCenterY = centerY;
-        lastOrbitZoom = zoom;
-        activeOrbitVersion = version;
-    };
-
-    const uniforms = new UniformGroup({
-        uResolution: { value: new Float32Array([window.innerWidth, window.innerHeight]), type: 'vec2<f32>' },
-        uCenterX: { value: new Float32Array(splitDouble(-0.5)), type: 'vec2<f32>' },
-        uCenterY: { value: new Float32Array(splitDouble(0)), type: 'vec2<f32>' },
-        uInvZoom: { value: new Float32Array(splitDouble(1 / cameraZoom)), type: 'vec2<f32>' },
-        uMaxIterations: { value: 200, type: 'i32' },
-        uColorIterations: { value: 320, type: 'i32' },
-        uLod: { value: 0, type: 'i32' },
-        uPrecisionMode: { value: 0, type: 'i32' },
-        uUsePerturb: { value: 0, type: 'i32' },
-        uPerturbBlend: { value: 0, type: 'f32' },
-        uRefLength: { value: 0, type: 'i32' },
-        uRefCenterX: { value: new Float32Array(splitDouble(cameraCenterX)), type: 'vec2<f32>' },
-        uRefCenterY: { value: new Float32Array(splitDouble(cameraCenterY)), type: 'vec2<f32>' },
-        uRefOrbit: { value: refOrbit, type: 'vec2<f32>', size: ORBIT_CAPACITY },
-        uTime: { value: 0, type: 'f32' },
-        uC: { value: new Float32Array([0.285, 0.01]), type: 'vec2<f32>' },
-        uZ0: { value: new Float32Array([0, 0]), type: 'vec2<f32>' },
-        uModeBlend: { value: 1, type: 'f32' },
-        uExponent: { value: 2, type: 'f32' },
-    });
-
-    const shader = new Shader({
-        glProgram: GlProgram.from({ vertex: vertexSrc, fragment: fragmentSrc }),
-        resources: { mandelbrotUniforms: uniforms },
-    });
-
-    const mesh = new Mesh({ geometry, shader });
-    app.stage.addChildAt(mesh, 0);
 
     perturbWorker.onmessage = (event: MessageEvent<{ id: number; length: number; orbit: Float32Array }>) => {
         pendingOrbitRequest = false;
@@ -843,15 +1037,17 @@ async function init() {
         if (version === undefined || version !== cameraVersion) return;
 
         latestAppliedOrbitId = id;
-        applyOrbit(orbit, length, lastOrbitCenterX, lastOrbitCenterY, lastOrbitZoom, version);
+        const requestedOrbitCenterX = ddToNumber(requestedOrbitCenterXDD);
+        const requestedOrbitCenterY = ddToNumber(requestedOrbitCenterYDD);
+        applyOrbit(orbit, length, requestedOrbitCenterX, requestedOrbitCenterY, requestedOrbitZoom, version);
         orbitUpdatedSinceLastFrame = true;
 
         orbitCache.push({
-            centerX: lastOrbitCenterX,
-            centerY: lastOrbitCenterY,
-            zoom: lastOrbitZoom,
+            centerX: requestedOrbitCenterX,
+            centerY: requestedOrbitCenterY,
+            zoom: requestedOrbitZoom,
             length: Math.min(length, ORBIT_CAPACITY),
-            orbit: new Float32Array(orbit),
+            orbit: new Float32Array(orbit.subarray(0, length * ORBIT_FLOATS_PER_POINT)),
             usedAt: performance.now(),
         });
         if (orbitCache.length > ORBIT_CACHE_LIMIT) {
@@ -869,102 +1065,156 @@ async function init() {
     let lodState = 1;
     let orbitUpdatedSinceLastFrame = false;
     let lastAdaptiveUpdateAt = 0;
+    let lastFrameTime = performance.now();
 
-    app.ticker.add(() => {
-        const frameMs = app.ticker.deltaMS;
-        const deltaCenter = viewport.center;
-        const deltaScale = viewport.scaled;
-        const hadInteraction = Math.abs(deltaCenter.x) > 1e-7
-            || Math.abs(deltaCenter.y) > 1e-7
-            || Math.abs(deltaScale - 1) > 1e-7;
+    const uniformLocations: Record<string, WebGLUniformLocation | null> = {};
+    const getLoc = (name: string) => {
+        if (!(name in uniformLocations)) {
+            uniformLocations[name] = gl.getUniformLocation(program, name);
+        }
+        return uniformLocations[name];
+    };
+
+    const setUniforms = () => {
+        gl.uniform2fv(getLoc('uResolution'), uniforms.uResolution);
+        gl.uniform2fv(getLoc('uCenterX'), uniforms.uCenterX);
+        gl.uniform2fv(getLoc('uCenterY'), uniforms.uCenterY);
+        gl.uniform2fv(getLoc('uInvZoom'), uniforms.uInvZoom);
+        gl.uniform1i(getLoc('uMaxIterations'), uniforms.uMaxIterations);
+        gl.uniform1i(getLoc('uColorIterations'), uniforms.uColorIterations);
+        gl.uniform1i(getLoc('uLod'), uniforms.uLod);
+        gl.uniform1i(getLoc('uPrecisionMode'), uniforms.uPrecisionMode);
+        gl.uniform1i(getLoc('uUsePerturb'), uniforms.uUsePerturb);
+        gl.uniform1f(getLoc('uPerturbBlend'), uniforms.uPerturbBlend);
+        gl.uniform1i(getLoc('uRefLength'), uniforms.uRefLength);
+        gl.uniform2fv(getLoc('uRefCenterX'), uniforms.uRefCenterX);
+        gl.uniform2fv(getLoc('uRefCenterY'), uniforms.uRefCenterY);
+        gl.activeTexture(gl.TEXTURE0);
+        gl.bindTexture(gl.TEXTURE_2D, orbitTex);
+        gl.uniform1i(getLoc('uRefOrbitTex'), 0);
+        gl.uniform2fv(getLoc('uCenterRefOffsetX'), uniforms.uCenterRefOffsetX);
+        gl.uniform2fv(getLoc('uCenterRefOffsetY'), uniforms.uCenterRefOffsetY);
+        gl.uniform1f(getLoc('uTime'), uniforms.uTime);
+        gl.uniform2fv(getLoc('uC'), uniforms.uC);
+        gl.uniform2fv(getLoc('uZ0'), uniforms.uZ0);
+        gl.uniform1f(getLoc('uModeBlend'), uniforms.uModeBlend);
+        gl.uniform1f(getLoc('uExponent'), uniforms.uExponent);
+    };
+
+    const tick = () => {
+        if (document.hidden) {
+            requestAnimationFrame(tick);
+            return;
+        }
+        const nowMs = performance.now();
+        const frameMs = nowMs - lastFrameTime;
+        lastFrameTime = nowMs;
+
+        const res = canvas.width;
+        const resY = canvas.height;
+        const idleMs = nowMs - lastInteractionAt;
         const activeInput = dragStart !== null
             || panStart !== null
             || blendDragStart !== null
             || touchTwoFingerStart !== null
             || pinchStart !== null;
+        const activelyInteracting = activeInput || idleMs < 180;
+        const centerXHi = cameraCenterXDD[0];
+        const centerXLo = cameraCenterXDD[1];
+        const centerYHi = cameraCenterYDD[0];
+        const centerYLo = cameraCenterYDD[1];
+        const [invZoomHi, invZoomLo] = splitDouble(1 / cameraZoom);
 
-        if (hadInteraction) {
-            const zoomBefore = cameraZoom;
-            cameraCenterX += deltaCenter.x / zoomBefore;
-            cameraCenterY += -deltaCenter.y / zoomBefore;
-            cameraZoom = Math.max(1e-3, Math.min(Number.MAX_VALUE, cameraZoom * deltaScale));
-            viewport.moveCenter(0, 0);
-            viewport.scaled = 1;
-            lastInteractionAt = performance.now();
-            cameraVersion += 1;
-            activeOrbitVersion = -1;
-        }
-
-        const nowMs = performance.now();
-        const zoom = cameraZoom;
-        const res = app.renderer.width / app.renderer.resolution;
-        const resY = app.renderer.height / app.renderer.resolution;
-        const idleMs = nowMs - lastInteractionAt;
-        const activelyInteracting = activeInput || hadInteraction || idleMs < 180;
-        const [centerXHi, centerXLo] = splitDouble(cameraCenterX);
-        const [centerYHi, centerYLo] = splitDouble(cameraCenterY);
-        const [invZoomHi, invZoomLo] = splitDouble(1 / zoom);
-
-        uniforms.uniforms.uResolution[0] = res;
-        uniforms.uniforms.uResolution[1] = resY;
-        uniforms.uniforms.uCenterX[0] = centerXHi;
-        uniforms.uniforms.uCenterX[1] = centerXLo;
-        uniforms.uniforms.uCenterY[0] = centerYHi;
-        uniforms.uniforms.uCenterY[1] = centerYLo;
-        uniforms.uniforms.uInvZoom[0] = invZoomHi;
-        uniforms.uniforms.uInvZoom[1] = invZoomLo;
+        uniforms.uResolution[0] = res;
+        uniforms.uResolution[1] = resY;
+        uniforms.uCenterX[0] = centerXHi;
+        uniforms.uCenterX[1] = centerXLo;
+        uniforms.uCenterY[0] = centerYHi;
+        uniforms.uCenterY[1] = centerYLo;
+        uniforms.uInvZoom[0] = invZoomHi;
+        uniforms.uInvZoom[1] = invZoomLo;
         const t = performance.now() * 0.001;
-        if (!animationPaused) {
-            uniforms.uniforms.uTime = t;
-        }
+        uniforms.uTime = t;
 
         const wobblePeriod = 90.0;
         const wobbleOmega = (2 * Math.PI) / wobblePeriod;
         const wobbleAmp = 0.4;
 
         if (mouseControlC !== null) {
-            uniforms.uniforms.uC[0] = Math.max(cLimits.realMin, Math.min(cLimits.realMax, mouseControlC.real));
-            uniforms.uniforms.uC[1] = Math.max(cLimits.imagMin, Math.min(cLimits.imagMax, mouseControlC.imag));
+            uniforms.uC[0] = Math.max(cLimits.realMin, Math.min(cLimits.realMax, mouseControlC.real));
+            uniforms.uC[1] = Math.max(cLimits.imagMin, Math.min(cLimits.imagMax, mouseControlC.imag));
         } else if (!animationPaused) {
             const periodRe = 45.0;
             const periodIm = 30.0;
             const omegaRe = (2 * Math.PI) / periodRe;
             const omegaIm = (2 * Math.PI) / periodIm;
-            const phaseRe = omegaRe * t + wobbleAmp * Math.sin(wobbleOmega * t);
-            const phaseIm = omegaIm * t + wobbleAmp * Math.sin(wobbleOmega * t * 1.3);
             const cAmp = 0.06;
             const cBase = 0.285;
+            const basePhaseRe = omegaRe * t + wobbleAmp * Math.sin(wobbleOmega * t);
+            const basePhaseIm = omegaIm * t + wobbleAmp * Math.sin(wobbleOmega * t * 1.3);
+            if (!lastFrameUsedFormulaC) {
+                const cRe = uniforms.uC[0];
+                const cIm = uniforms.uC[1];
+                const cosVal = Math.max(-1, Math.min(1, (cRe - cBase) / cAmp));
+                const sinVal = Math.max(-1, Math.min(1, cIm / cAmp));
+                phaseOffsetCRe = Math.acos(cosVal) - basePhaseRe;
+                phaseOffsetCIm = Math.asin(sinVal) - basePhaseIm;
+            }
+            const phaseRe = basePhaseRe + phaseOffsetCRe;
+            const phaseIm = basePhaseIm + phaseOffsetCIm;
             const cRe = cBase + cAmp * Math.cos(phaseRe);
             const cIm = cAmp * Math.sin(phaseIm);
-            uniforms.uniforms.uC[0] = Math.max(cLimits.realMin, Math.min(cLimits.realMax, cRe));
-            uniforms.uniforms.uC[1] = Math.max(cLimits.imagMin, Math.min(cLimits.imagMax, cIm));
+            uniforms.uC[0] = Math.max(cLimits.realMin, Math.min(cLimits.realMax, cRe));
+            uniforms.uC[1] = Math.max(cLimits.imagMin, Math.min(cLimits.imagMax, cIm));
         }
 
         if (mouseControlZ0 !== null) {
-            uniforms.uniforms.uZ0[0] = Math.max(z0Limits.realMin, Math.min(z0Limits.realMax, mouseControlZ0.real));
-            uniforms.uniforms.uZ0[1] = Math.max(z0Limits.imagMin, Math.min(z0Limits.imagMax, mouseControlZ0.imag));
+            uniforms.uZ0[0] = Math.max(z0Limits.realMin, Math.min(z0Limits.realMax, mouseControlZ0.real));
+            uniforms.uZ0[1] = Math.max(z0Limits.imagMin, Math.min(z0Limits.imagMax, mouseControlZ0.imag));
         } else if (!animationPaused) {
             const z0PeriodRe = 55.0;
             const z0PeriodIm = 38.0;
             const z0OmegaRe = (2 * Math.PI) / z0PeriodRe;
             const z0OmegaIm = (2 * Math.PI) / z0PeriodIm;
             const z0Amp = 0.15;
-            const phaseZ0Re = z0OmegaRe * t + wobbleAmp * Math.sin(wobbleOmega * t * 0.8);
-            const phaseZ0Im = z0OmegaIm * t + wobbleAmp * Math.sin(wobbleOmega * t * 1.1);
+            const basePhaseZ0Re = z0OmegaRe * t + wobbleAmp * Math.sin(wobbleOmega * t * 0.8);
+            const basePhaseZ0Im = z0OmegaIm * t + wobbleAmp * Math.sin(wobbleOmega * t * 1.1);
+            if (!lastFrameUsedFormulaZ0) {
+                const z0Re = uniforms.uZ0[0];
+                const z0Im = uniforms.uZ0[1];
+                const cosVal = Math.max(-1, Math.min(1, z0Re / z0Amp));
+                const sinVal = Math.max(-1, Math.min(1, z0Im / z0Amp));
+                phaseOffsetZ0Re = Math.acos(cosVal) - basePhaseZ0Re;
+                phaseOffsetZ0Im = Math.asin(sinVal) - basePhaseZ0Im;
+            }
+            const phaseZ0Re = basePhaseZ0Re + phaseOffsetZ0Re;
+            const phaseZ0Im = basePhaseZ0Im + phaseOffsetZ0Im;
             const z0Re = z0Amp * Math.cos(phaseZ0Re);
             const z0Im = z0Amp * Math.sin(phaseZ0Im);
-            uniforms.uniforms.uZ0[0] = Math.max(z0Limits.realMin, Math.min(z0Limits.realMax, z0Re));
-            uniforms.uniforms.uZ0[1] = Math.max(z0Limits.imagMin, Math.min(z0Limits.imagMax, z0Im));
+            uniforms.uZ0[0] = Math.max(z0Limits.realMin, Math.min(z0Limits.realMax, z0Re));
+            uniforms.uZ0[1] = Math.max(z0Limits.imagMin, Math.min(z0Limits.imagMax, z0Im));
         }
 
         if (!animationPaused && blendDragStart === null) {
             const blendPeriod = 120.0;
             const expPeriod = 90.0;
-            modeBlend = Math.max(0, Math.min(1, 0.5 + 0.5 * Math.sin(t * (2 * Math.PI) / blendPeriod)));
-            exponent = Math.max(1.01, Math.min(8, 2 + 1.5 * (0.5 + 0.5 * Math.sin(t * (2 * Math.PI) / expPeriod + 0.5))));
+            const blendPhase = t * (2 * Math.PI) / blendPeriod;
+            const expPhase = t * (2 * Math.PI) / expPeriod + 0.5;
+            if (!lastFrameUsedFormulaBlend) {
+                const blendSinVal = Math.max(-1, Math.min(1, 2 * modeBlend - 1));
+                const expInner = (exponent - 2) / 1.5 - 0.5;
+                const expSinVal = Math.max(-1, Math.min(1, 2 * expInner));
+                phaseOffsetBlend = Math.asin(blendSinVal) - blendPhase;
+                phaseOffsetExp = Math.asin(expSinVal) - expPhase;
+            }
+            modeBlend = Math.max(0, Math.min(1, 0.5 + 0.5 * Math.sin(blendPhase + phaseOffsetBlend)));
+            exponent = Math.max(1.01, Math.min(8, 2 + 1.5 * (0.5 + 0.5 * Math.sin(expPhase + phaseOffsetExp))));
         }
-        uniforms.uniforms.uModeBlend = modeBlend;
-        uniforms.uniforms.uExponent = exponent;
+        uniforms.uModeBlend = modeBlend;
+        uniforms.uExponent = exponent;
+        lastFrameUsedFormulaC = mouseControlC === null && !animationPaused;
+        lastFrameUsedFormulaZ0 = mouseControlZ0 === null && !animationPaused;
+        lastFrameUsedFormulaBlend = !animationPaused && blendDragStart === null;
         const hadOrbitUpdate = orbitUpdatedSinceLastFrame;
         const dynamicUpdate = activelyInteracting || !animationPaused || hadOrbitUpdate;
         const interactionDebounceReady = !activelyInteracting
@@ -981,32 +1231,38 @@ async function init() {
         orbitUpdatedSinceLastFrame = false;
 
         const targetFrameMs = 1000 / TARGET_FPS;
+        const zoom = cameraZoom;
         if (adaptiveUpdate) {
-            smoothedFrameMs = smoothedFrameMs * 0.9 + frameMs * 0.1;
-            if (smoothedFrameMs > targetFrameMs * 1.16) {
-                qualityScale *= 0.94;
+            smoothedFrameMs = smoothedFrameMs * 0.95 + frameMs * 0.05;
+            if (smoothedFrameMs > targetFrameMs * 1.2) {
+                qualityScale *= 0.995;
             } else if (smoothedFrameMs < targetFrameMs * 0.9) {
-                qualityScale *= 1.015;
+                qualityScale *= 1.005;
             }
-            if (frameMs > targetFrameMs * 1.7) {
-                qualityScale *= 0.86;
+            if (frameMs > targetFrameMs * 2.0) {
+                qualityScale *= 0.98;
             }
             qualityScale = Math.max(QUALITY_MIN, Math.min(QUALITY_MAX, qualityScale));
         }
-        const effectiveQuality = activelyInteracting ? Math.max(QUALITY_MIN, qualityScale * 0.62) : qualityScale;
+        const effectiveQuality = activelyInteracting ? Math.max(QUALITY_MIN, qualityScale * 0.85) : qualityScale;
 
         if (adaptiveUpdate) {
             if (lodState <= 0) {
-                if (effectiveQuality > 0.94) lodState = 1;
+                if (effectiveQuality > 0.8) lodState = 1;
             } else if (lodState === 1) {
-                if (effectiveQuality < 0.72) lodState = 0;
-                else if (effectiveQuality > 1.86 && !activelyInteracting) lodState = 2;
+                if (effectiveQuality < 0.6) lodState = 0;
+                else if (effectiveQuality > 1.6 && !activelyInteracting) lodState = 2;
             } else {
-                if (effectiveQuality < 1.5 || activelyInteracting) lodState = 1;
+                if (effectiveQuality < 1.2) lodState = 1;
             }
         }
-        uniforms.uniforms.uLod = lodState;
-        uniforms.uniforms.uPrecisionMode = 0;
+        uniforms.uLod = lodState;
+        uniforms.uPrecisionMode = 1;
+
+        const cameraCenterX = ddToNumber(cameraCenterXDD);
+        const cameraCenterY = ddToNumber(cameraCenterYDD);
+        const lastOrbitCenterX = ddToNumber(lastOrbitCenterXDD);
+        const lastOrbitCenterY = ddToNumber(lastOrbitCenterYDD);
 
         const orbitDriftPxRaw = Math.hypot(
             (cameraCenterX - lastOrbitCenterX) * zoom,
@@ -1044,8 +1300,20 @@ async function init() {
         const orbitZoomDelta = Math.abs(Math.log2(Math.max(1e-12, zoom / lastOrbitZoom)));
         const orbitStale = orbitDriftPx > 48 || orbitZoomDelta > 0.3;
 
-        uniforms.uniforms.uUsePerturb = 0;
-        uniforms.uniforms.uPerturbBlend = 0;
+        const usePerturb = refLength > 0 && zoom > 2e5;
+        const perturbBlend = usePerturb
+            ? (orbitStale ? (activelyInteracting ? 0.35 : 0.0) : 1.0)
+            : 0.0;
+        uniforms.uUsePerturb = usePerturb ? 1 : 0;
+        uniforms.uPerturbBlend = perturbBlend;
+        if (usePerturb) {
+            const [offXHi, offXLo] = ddSub(cameraCenterXDD, lastOrbitCenterXDD);
+            const [offYHi, offYLo] = ddSub(cameraCenterYDD, lastOrbitCenterYDD);
+            uniforms.uCenterRefOffsetX[0] = offXHi;
+            uniforms.uCenterRefOffsetX[1] = offXLo;
+            uniforms.uCenterRefOffsetY[0] = offYHi;
+            uniforms.uCenterRefOffsetY[1] = offYLo;
+        }
 
         const shouldRequestOrbit = zoom > 2e5
             && !pendingOrbitRequest
@@ -1054,12 +1322,20 @@ async function init() {
             pendingOrbitRequest = true;
             refRequestId += 1;
             requestVersionById.set(refRequestId, cameraVersion);
-            lastOrbitCenterX = cameraCenterX;
-            lastOrbitCenterY = cameraCenterY;
-            lastOrbitZoom = zoom;
-            const [reqXHi, reqXLo] = splitDouble(cameraCenterX);
-            const [reqYHi, reqYLo] = splitDouble(cameraCenterY);
-            const precisionDigits = Math.min(220, Math.max(64, Math.floor(Math.log10(Math.max(10, zoom))) + 48));
+            requestedOrbitCenterXDD = [cameraCenterXDD[0], cameraCenterXDD[1]];
+            requestedOrbitCenterYDD = [cameraCenterYDD[0], cameraCenterYDD[1]];
+            requestedOrbitZoom = zoom;
+            const reqXHi = cameraCenterXDD[0];
+            const reqXLo = cameraCenterXDD[1];
+            const reqYHi = cameraCenterYDD[0];
+            const reqYLo = cameraCenterYDD[1];
+            // Keep extra decimal margin so reference orbit remains stable at deep zoom.
+            const logZoom = Math.log10(Math.max(1, zoom));
+            const iterHint = Math.max(ORBIT_CAPACITY, uniforms.uMaxIterations);
+            const precisionDigits = Math.min(
+                512,
+                Math.max(64, Math.ceil(logZoom) + 28, Math.ceil(Math.log2(iterHint + 1)) * 14),
+            );
             perturbWorker.postMessage({
                 id: refRequestId,
                 centerXHi: reqXHi,
@@ -1074,30 +1350,31 @@ async function init() {
         if (adaptiveUpdate) {
             const iterBase = 240 + Math.log2(Math.max(1, zoom)) * 58;
             const iterTarget = Math.min(4096, Math.floor(iterBase * effectiveQuality));
-            const maxStep = 200;
+            const maxStepUp = 40;
+            const maxStepDown = 2;
             if (currentIterations < iterTarget) {
-                currentIterations = Math.min(iterTarget, currentIterations + maxStep);
+                currentIterations = Math.min(iterTarget, currentIterations + maxStepUp);
             } else {
-                currentIterations = Math.max(iterTarget, currentIterations - maxStep * 2);
+                currentIterations = Math.max(iterTarget, currentIterations - maxStepDown);
             }
-            uniforms.uniforms.uMaxIterations = Math.floor(currentIterations);
+            uniforms.uMaxIterations = Math.floor(currentIterations);
 
             const colorTarget = Math.min(4096, Math.floor(iterBase));
             if (colorIterations < colorTarget) {
-                colorIterations = Math.min(colorTarget, colorIterations + 24);
+                colorIterations = Math.min(colorTarget, colorIterations + 12);
             } else {
-                colorIterations = Math.max(colorTarget, colorIterations - 4);
+                colorIterations = Math.max(colorTarget, colorIterations - 1);
             }
-            uniforms.uniforms.uColorIterations = colorIterations;
+            uniforms.uColorIterations = colorIterations;
             if (!activelyInteracting && smoothedFrameMs <= targetFrameMs * 1.04) {
-                discoveredCapacity = Math.max(discoveredCapacity, uniforms.uniforms.uMaxIterations);
+                discoveredCapacity = Math.max(discoveredCapacity, uniforms.uMaxIterations);
             }
         }
 
-        const cReal = uniforms.uniforms.uC[0];
-        const cImag = uniforms.uniforms.uC[1];
-        const z0Real = uniforms.uniforms.uZ0[0];
-        const z0Imag = uniforms.uniforms.uZ0[1];
+        const cReal = uniforms.uC[0];
+        const cImag = uniforms.uC[1];
+        const z0Real = uniforms.uZ0[0];
+        const z0Imag = uniforms.uZ0[1];
 
         paramRows.modeBlend.set(modeBlend, modeBlend.toFixed(2));
         paramRows.exponent.set(normalize(exponent, 1.01, 8), exponent.toFixed(2));
@@ -1108,7 +1385,7 @@ async function init() {
 
         const logZoom = Math.log10(Math.max(1, zoom));
         paramRows.zoom.set(Math.min(1, logZoom / 12), zoom.toExponential(2));
-        const maxIterations = uniforms.uniforms.uMaxIterations;
+        const maxIterations = uniforms.uMaxIterations;
         paramRows.iterations.set(Math.min(1, maxIterations / 4096), maxIterations.toString());
         const fps = 1000 / Math.max(0.0001, smoothedFrameMs);
         paramRows.fps.set(Math.min(1, fps / 120), fps.toFixed(1));
@@ -1116,10 +1393,22 @@ async function init() {
             Math.min(1, discoveredCapacity / 4096),
             `${Math.round(qualityScale * 100)}% (${discoveredCapacity} it)`,
         );
-    });
+
+        setUniforms();
+        gl.useProgram(program);
+        gl.bindBuffer(gl.ARRAY_BUFFER, vbo);
+        gl.enableVertexAttribArray(positionLoc);
+        gl.vertexAttribPointer(positionLoc, 2, gl.FLOAT, false, 0, 0);
+        gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, ebo);
+        gl.drawElements(gl.TRIANGLES, 6, gl.UNSIGNED_SHORT, 0);
+
+        requestAnimationFrame(tick);
+    };
+
+    requestAnimationFrame(tick);
 
     window.addEventListener('resize', () => {
-        viewport.resize(window.innerWidth, window.innerHeight);
+        resize();
         cameraVersion += 1;
         activeOrbitVersion = -1;
     });
