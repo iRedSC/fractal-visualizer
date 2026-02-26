@@ -1,11 +1,13 @@
-# Nixpacks configuration for Vite static site deployment
-# Node provider detects Vite and serves the built app with Caddy
+# Nixpacks config for Dokploy deployment
+# Use npm in container to avoid Bun exit 132 on some hosts.
+
+providers = ["node"]
 
 [phases.install]
-cmds = ["bun install --frozen-lockfile"]
+cmds = ["npm install"]
 
 [phases.build]
-cmds = ["bun run build"]
+cmds = ["npm run build"]
 
 [variables]
 NODE_ENV = "production"

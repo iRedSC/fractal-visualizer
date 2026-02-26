@@ -1,5 +1,6 @@
 # Dependencies - installed fresh during build
 node_modules
+bun.lock
 
 # Local build output - rebuilt during deploy
 dist
