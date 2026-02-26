@@ -8,6 +8,10 @@ type OrbitRequest = {
     centerYLo: number;
     maxIterations: number;
     precisionDigits: number;
+    mode: 'mandelbrot' | 'julia' | 'blended';
+    modeBlend?: number;
+    cReal?: number;
+    cImag?: number;
 };
 
 type OrbitResponse = {
@@ -28,13 +32,35 @@ self.onmessage = (event: MessageEvent<OrbitRequest>) => {
     const precision = Math.min(512, Math.max(req.precisionDigits, minPrecisionFromIterations));
     Decimal.set({ precision, rounding: Decimal.ROUND_HALF_EVEN });
 
-    const cx = new Decimal(req.centerXHi).plus(req.centerXLo);
-    const cy = new Decimal(req.centerYHi).plus(req.centerYLo);
+    const centerX = new Decimal(req.centerXHi).plus(req.centerXLo);
+    const centerY = new Decimal(req.centerYHi).plus(req.centerYLo);
+    const mode = req.mode ?? 'mandelbrot';
+    const blend = req.modeBlend ?? 0;
+    const cRe = req.cReal ?? 0;
+    const cIm = req.cImag ?? 0;
 
-    // Output as double-double: 4 floats per point [re_hi, re_lo, im_hi, im_lo]
+    let zr: Decimal;
+    let zi: Decimal;
+    let cx: Decimal;
+    let cy: Decimal;
+    if (mode === 'mandelbrot') {
+        zr = new Decimal(0);
+        zi = new Decimal(0);
+        cx = centerX;
+        cy = centerY;
+    } else if (mode === 'julia') {
+        zr = centerX;
+        zi = centerY;
+        cx = new Decimal(cRe);
+        cy = new Decimal(cIm);
+    } else {
+        zr = centerX.mul(blend);
+        zi = centerY.mul(blend);
+        cx = centerX.mul(1 - blend).plus(new Decimal(cRe).mul(blend));
+        cy = centerY.mul(1 - blend).plus(new Decimal(cIm).mul(blend));
+    }
+
     const out = new Float32Array(req.maxIterations * 4);
-    let zr = new Decimal(0);
-    let zi = new Decimal(0);
     let length = 0;
 
     for (let i = 0; i < req.maxIterations; i += 1) {
