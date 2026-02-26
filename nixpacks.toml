@@ -1,9 +1,14 @@
 # Nixpacks configuration for Vite static site deployment
 # Node provider detects Vite and serves the built app with Caddy
 
+[phases.install]
+cmds = ["bun install --frozen-lockfile"]
+
 [phases.build]
-cmds = ["npm run build"]
+cmds = ["bun run build"]
 
 [variables]
 NODE_ENV = "production"
 NIXPACKS_SPA_OUT_DIR = "dist"
+# Port for Caddy to listen on (Dokploy sets PORT at runtime; override in env vars if needed)
+PORT = "3000"
