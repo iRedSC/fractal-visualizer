@@ -1,0 +1,20 @@
+{
+  "name": "fractals",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc && vite build",
+    "preview": "vite preview"
+  },
+  "devDependencies": {
+    "typescript": "~5.9.3",
+    "vite": "^7.3.1"
+  },
+  "dependencies": {
+    "decimal.js": "^10.6.0",
+    "pixi-viewport": "^6.0.3",
+    "pixi.js": "^8.16.0"
+  }
+}

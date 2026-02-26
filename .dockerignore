@@ -1,0 +1,19 @@
+# Dependencies - installed fresh during build
+node_modules
+
+# Local build output - rebuilt during deploy
+dist
+
+# Version control
+.git
+.gitignore
+
+# IDE and OS files
+.vscode
+.idea
+*.swp
+.DS_Store
+
+# Env files (use platform env vars instead)
+.env
+.env.*

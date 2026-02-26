@@ -1,0 +1,9 @@
+# Nixpacks configuration for Vite static site deployment
+# Node provider detects Vite and serves the built app with Caddy
+
+[phases.build]
+cmds = ["npm run build"]
+
+[variables]
+NODE_ENV = "production"
+NIXPACKS_SPA_OUT_DIR = "dist"
