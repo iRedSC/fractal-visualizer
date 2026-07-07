@@ -5,9 +5,47 @@
     <link rel="icon" type="image/svg+xml" href="/vite.svg" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>fractals</title>
+    <style>
+      /* Inlined so the spinner is visible before the bundle loads. */
+      html, body { margin: 0; height: 100%; background: #000; }
+      #loader {
+        position: fixed;
+        inset: 0;
+        z-index: 100;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        background: #000;
+        transition: opacity 300ms ease;
+      }
+      #loader.loader-hidden { opacity: 0; pointer-events: none; }
+      #loader .spinner {
+        width: 44px;
+        height: 44px;
+        border-radius: 50%;
+        border: 3px solid rgba(170, 194, 255, 0.2);
+        border-top-color: rgba(125, 188, 255, 0.95);
+        animation: loader-spin 0.9s linear infinite;
+      }
+      #loader .loader-error {
+        max-width: 420px;
+        padding: 0 20px;
+        text-align: center;
+        color: rgba(230, 236, 255, 0.95);
+        font-family: ui-sans-serif, system-ui, sans-serif;
+        font-size: 14px;
+        line-height: 1.5;
+      }
+      @keyframes loader-spin {
+        to { transform: rotate(360deg); }
+      }
+    </style>
   </head>
   <body>
     <div id="app"></div>
+    <div id="loader" aria-label="Loading">
+      <div class="spinner"></div>
+    </div>
     <script type="module" src="/src/main.ts"></script>
   </body>
 </html>

@@ -1,13 +1,15 @@
 import './style.css';
 
-const ORBIT_CAPACITY = 1024;
-const ORBIT_FLOATS_PER_POINT = 4;
-const ORBIT_CACHE_LIMIT = 12;
-const TARGET_FPS = 58;
-const QUALITY_MIN = 0.35;
-const QUALITY_MAX = 2.2;
-const INTERACTION_RECALC_DEBOUNCE_MS = 48;
 const WHEEL_ZOOM_FACTOR = 1.08;
+const MIN_ZOOM = 1e-3;
+// Double-single (hi/lo float32) arithmetic stays pixel-accurate to roughly
+// 2^-48 relative precision; beyond this zoom the image would degrade.
+const MAX_ZOOM = 1e10;
+// Below this zoom plain float32 iteration is visually identical to
+// double-single and several times faster.
+const FLOAT_PRECISION_MAX_ZOOM = 1e4;
+const MAX_ITERATIONS = 4096;
+const HUD_UPDATE_INTERVAL_MS = 200;
 
 const vertexSrc = `#version 300 es
     in vec2 aPosition;
@@ -31,18 +33,7 @@ const fragmentSrc = `#version 300 es
     uniform vec2 uInvZoom;
     uniform int uMaxIterations;
     uniform int uColorIterations;
-    uniform int uLod;
     uniform int uPrecisionMode;
-    uniform int uUsePerturb;
-    uniform float uPerturbBlend;
-    uniform int uRefLength;
-    uniform vec2 uRefCenterX;
-    uniform vec2 uRefCenterY;
-    uniform sampler2D uRefOrbitTex;
-    uniform vec2 uCenterRefOffsetX;
-    uniform vec2 uCenterRefOffsetY;
-    uniform float uPerturbDcCoeff;
-    uniform float uPerturbDz0Coeff;
     uniform float uTime;
     uniform vec2 uC;
     uniform vec2 uZ0;
@@ -66,6 +57,12 @@ const fragmentSrc = `#version 300 es
         return vec2(s, err);
     }
 
+    vec2 dsAdd(vec2 a, vec2 b) {
+        vec2 s = twoSum(a.x, b.x);
+        float e = a.y + b.y + s.y;
+        return twoSum(s.x, e);
+    }
+
     vec2 twoProd(float a, float b) {
         float p = a * b;
         const float split = 4097.0;
@@ -79,29 +76,10 @@ const fragmentSrc = `#version 300 es
         return vec2(p, err);
     }
 
-    vec2 dsAdd(vec2 a, vec2 b) {
-        vec2 s = twoSum(a.x, b.x);
-        float e = a.y + b.y + s.y;
-        vec2 r = twoSum(s.x, e);
-        return vec2(r.x, r.y);
-    }
-
     vec2 dsMulFloat(vec2 a, float b) {
         vec2 p = twoProd(a.x, b);
         float e = a.y * b + p.y;
-        vec2 r = twoSum(p.x, e);
-        return vec2(r.x, r.y);
-    }
-
-    vec2 dsSub(vec2 a, vec2 b) {
-        return dsAdd(a, vec2(-b.x, -b.y));
-    }
-
-    vec2 dsMul(vec2 a, vec2 b) {
-        vec2 p = twoProd(a.x, b.x);
-        float e = a.x * b.y + a.y * b.x + p.y;
-        vec2 r = twoSum(p.x, e);
-        return vec2(r.x, r.y);
+        return twoSum(p.x, e);
     }
 
     vec3 gradient(float t) {
@@ -119,14 +97,6 @@ const fragmentSrc = `#version 300 es
         return mix(black, color, fade);
     }
 
-    vec2 pixelToComplex(vec2 pixelPos) {
-        float dx = pixelPos.x - uResolution.x * 0.5;
-        float dy = uResolution.y * 0.5 - pixelPos.y;
-        vec2 cxDs = dsAdd(uCenterX, dsMulFloat(uInvZoom, dx));
-        vec2 cyDs = dsAdd(uCenterY, dsMulFloat(uInvZoom, dy));
-        return vec2(cxDs.x + cxDs.y, cyDs.x + cyDs.y);
-    }
-
     vec4 pixelToComplexDS(vec2 pixelPos) {
         float dx = pixelPos.x - uResolution.x * 0.5;
         float dy = uResolution.y * 0.5 - pixelPos.y;
@@ -135,21 +105,19 @@ const fragmentSrc = `#version 300 es
         return vec4(cx.x, cx.y, cy.x, cy.y);
     }
 
-    float iterSmooth(vec2 z0, vec2 c, float maxIter) {
+    float iterSmooth(vec2 z0, vec2 c, int limit) {
         vec2 z = z0;
         float iter = 0.0;
-        int limit = int(maxIter);
-        if (limit < 1) limit = 1;
-        if (limit > uMaxIterations) limit = uMaxIterations;
 
-        for (int i = 0; i < 4096; i++) {
+        for (int i = 0; i < ${MAX_ITERATIONS}; i++) {
             if (i >= limit) break;
             vec2 zp = complexPow(z, uExponent);
             float x = zp.x + c.x;
             float y = zp.y + c.y;
-            if ((x * x + y * y) > 4.0) {
-                float mag2 = max(x * x + y * y, 4.000001);
-                return iter + 1.0 - log2(log2(mag2));
+            float mag2 = x * x + y * y;
+            if (mag2 > 4.0) {
+                float safeMag2 = max(mag2, 4.000001);
+                return iter + 1.0 - log2(log2(safeMag2));
             }
             z = vec2(x, y);
             iter += 1.0;
@@ -163,102 +131,14 @@ const fragmentSrc = `#version 300 es
         return complexPow(vec2(x, y), p);
     }
 
-    float iterSmoothDS(vec4 z0Full, vec4 cFull, float maxIter) {
+    float iterSmoothDS(vec4 z0Full, vec4 cFull, int limit) {
         vec2 zx = z0Full.xy;
         vec2 zy = z0Full.zw;
         vec2 cx = cFull.xy;
         vec2 cy = cFull.zw;
         float iter = 0.0;
-        int limit = int(maxIter);
-        if (limit < 1) limit = 1;
-        if (limit > uMaxIterations) limit = uMaxIterations;
 
-        for (int i = 0; i < 4096; i++) {
-            if (i >= limit) break;
-            vec2 zp = dsComplexPow(zx, zy, uExponent);
-            vec2 nzx = dsAdd(vec2(zp.x, 0.0), cx);
-            vec2 nzy = dsAdd(vec2(zp.y, 0.0), cy);
-            float x = nzx.x + nzx.y;
-            float y = nzy.x + nzy.y;
-            float mag2 = x * x + y * y;
-            if (mag2 > 4.0) {
-                float safeMag2 = max(mag2, 4.000001);
-                return iter + 1.0 - log2(log2(safeMag2));
-            }
-            zx = nzx;
-            zy = nzy;
-            iter += 1.0;
-        }
-        return -1.0;
-    }
-
-    float mandelbrotSmooth(vec2 c, float maxIter) {
-        return iterSmooth(vec2(0.0, 0.0), c, maxIter);
-    }
-
-    float juliaSmooth(vec2 z0, float maxIter) {
-        vec2 z = z0;
-        vec2 c = uC;
-        float iter = 0.0;
-        int limit = int(maxIter);
-        if (limit < 1) limit = 1;
-        if (limit > uMaxIterations) limit = uMaxIterations;
-
-        for (int i = 0; i < 4096; i++) {
-            if (i >= limit) break;
-            vec2 zp = complexPow(z, uExponent);
-            float x = zp.x + c.x;
-            float y = zp.y + c.y;
-            if ((x * x + y * y) > 4.0) {
-                float mag2 = max(x * x + y * y, 4.000001);
-                return iter + 1.0 - log2(log2(mag2));
-            }
-            z = vec2(x, y);
-            iter += 1.0;
-        }
-        return -1.0;
-    }
-
-    float mandelbrotSmoothDS(vec4 cFull, float maxIter) {
-        vec2 zx = vec2(0.0, 0.0);
-        vec2 zy = vec2(0.0, 0.0);
-        vec2 cx = cFull.xy;
-        vec2 cy = cFull.zw;
-        float iter = 0.0;
-        int limit = int(maxIter);
-        if (limit < 1) limit = 1;
-        if (limit > uMaxIterations) limit = uMaxIterations;
-
-        for (int i = 0; i < 4096; i++) {
-            if (i >= limit) break;
-            vec2 zp = dsComplexPow(zx, zy, uExponent);
-            vec2 nzx = dsAdd(vec2(zp.x, 0.0), cx);
-            vec2 nzy = dsAdd(vec2(zp.y, 0.0), cy);
-            float x = nzx.x + nzx.y;
-            float y = nzy.x + nzy.y;
-            float mag2 = x * x + y * y;
-            if (mag2 > 4.0) {
-                float safeMag2 = max(mag2, 4.000001);
-                return iter + 1.0 - log2(log2(safeMag2));
-            }
-            zx = nzx;
-            zy = nzy;
-            iter += 1.0;
-        }
-        return -1.0;
-    }
-
-    float juliaSmoothDS(vec4 z0, float maxIter) {
-        vec2 zx = z0.xy;
-        vec2 zy = z0.zw;
-        vec2 cx = vec2(uC.x, 0.0);
-        vec2 cy = vec2(uC.y, 0.0);
-        float iter = 0.0;
-        int limit = int(maxIter);
-        if (limit < 1) limit = 1;
-        if (limit > uMaxIterations) limit = uMaxIterations;
-
-        for (int i = 0; i < 4096; i++) {
+        for (int i = 0; i < ${MAX_ITERATIONS}; i++) {
             if (i >= limit) break;
             vec2 zp = dsComplexPow(zx, zy, uExponent);
             vec2 nzx = dsAdd(vec2(zp.x, 0.0), cx);
@@ -284,204 +164,41 @@ const fragmentSrc = `#version 300 es
         return gradient(t);
     }
 
-    vec2 complexMul(vec2 a, vec2 b) {
-        return vec2(a.x * b.x - a.y * b.y, a.x * b.y + a.y * b.x);
-    }
-
-    vec4 dsComplexAdd(vec4 a, vec4 b) {
-        vec2 re = dsAdd(a.xy, b.xy);
-        vec2 im = dsAdd(a.zw, b.zw);
-        return vec4(re, im);
-    }
-
-    vec4 dsComplexMul(vec4 a, vec4 b) {
-        vec2 re = dsSub(dsMul(a.xy, b.xy), dsMul(a.zw, b.zw));
-        vec2 im = dsAdd(dsMul(a.xy, b.zw), dsMul(a.zw, b.xy));
-        return vec4(re, im);
-    }
-
-    vec4 dsComplexScale(vec4 z, float s) {
-        vec2 re = dsMulFloat(z.xy, s);
-        vec2 im = dsMulFloat(z.zw, s);
-        return vec4(re, im);
-    }
-
-    float dsComplexMag2(vec4 z) {
-        vec2 re2 = dsMul(z.xy, z.xy);
-        vec2 im2 = dsMul(z.zw, z.zw);
-        vec2 mag2 = dsAdd(re2, im2);
-        return mag2.x + mag2.y;
-    }
-
-    float mandelbrotSmoothPerturb(vec4 dcFull, vec4 cFull, float maxIter) {
-        int maxLimit = int(maxIter);
-        if (maxLimit < 1) maxLimit = 1;
-        if (maxLimit > uMaxIterations) maxLimit = uMaxIterations;
-        int limit = uRefLength;
-        if (maxLimit < limit) limit = maxLimit;
-        if (limit > 1024) limit = 1024;
-        vec4 dz = dsComplexScale(dcFull, uPerturbDz0Coeff);
-        float iter = 0.0;
-        vec4 z = vec4(0.0);
-        bool needFullPrecision = false;
-
-        for (int i = 0; i < 1024; i++) {
-            if (i >= limit) break;
-            vec4 Zi = texelFetch(uRefOrbitTex, ivec2(i, 0), 0);
-            z = dsComplexAdd(Zi, dz);
-            float mag2 = dsComplexMag2(z);
-            if (mag2 > 4.0) {
-                float safeMag2 = max(mag2, 4.000001);
-                return iter + 1.0 - log2(log2(safeMag2));
-            }
-            float dzMag2 = dsComplexMag2(dz);
-            float ZMag2 = dsComplexMag2(Zi);
-            if (dzMag2 > ZMag2) {
-                needFullPrecision = true;
-                break;
-            }
-            float dzMag = sqrt(dzMag2);
-            if (dzMag > 1e-30 && mag2 < dzMag2 * 1e-20) {
-                needFullPrecision = true;
-                break;
-            }
-            vec4 twoZdz = dsComplexScale(dsComplexMul(Zi, dz), 2.0);
-            vec4 dz2 = dsComplexMul(dz, dz);
-            vec4 dcScaled = dsComplexScale(dcFull, uPerturbDcCoeff);
-            dz = dsComplexAdd(dsComplexAdd(twoZdz, dz2), dcScaled);
-            iter += 1.0;
-        }
-
-        if (needFullPrecision) {
-            vec2 zx = z.xy;
-            vec2 zy = z.zw;
-            vec2 cx = cFull.xy;
-            vec2 cy = cFull.zw;
-            int remaining = maxLimit - int(iter);
-            for (int i = 0; i < 4096; i++) {
-                if (i >= remaining) break;
-                vec2 zx2 = dsMul(zx, zx);
-                vec2 zy2 = dsMul(zy, zy);
-                vec2 zxy = dsMul(zx, zy);
-                vec2 nx = dsAdd(dsSub(zx2, zy2), cx);
-                vec2 ny = dsAdd(dsMulFloat(zxy, 2.0), cy);
-                float x = nx.x + nx.y;
-                float y = ny.x + ny.y;
-                float mag2 = x * x + y * y;
-                if (mag2 > 4.0) {
-                    float safeMag2 = max(mag2, 4.000001);
-                    return iter + 1.0 - log2(log2(safeMag2));
-                }
-                zx = nx;
-                zy = ny;
-                iter += 1.0;
-            }
-            return -1.0;
-        }
-
-        vec2 zx = z.xy;
-        vec2 zy = z.zw;
-        vec2 cx = cFull.xy;
-        vec2 cy = cFull.zw;
-
-        for (int i = 0; i < 4096; i++) {
-            if (i >= maxLimit - limit) break;
-            vec2 zx2 = dsMul(zx, zx);
-            vec2 zy2 = dsMul(zy, zy);
-            vec2 zxy = dsMul(zx, zy);
-            vec2 nx = dsAdd(dsSub(zx2, zy2), cx);
-            vec2 ny = dsAdd(dsMulFloat(zxy, 2.0), cy);
-            float x = nx.x + nx.y;
-            float y = ny.x + ny.y;
-            float mag2 = x * x + y * y;
-            if (mag2 > 4.0) {
-                float safeMag2 = max(mag2, 4.000001);
-                return iter + 1.0 - log2(log2(safeMag2));
-            }
-            zx = nx;
-            zy = ny;
-            iter += 1.0;
-        }
-        return -1.0;
-    }
-
-    vec3 sampleColorAtPixel(vec2 pixelPos, float maxIter) {
-        vec4 pixelPosDS = pixelToComplexDS(pixelPos);
-        vec2 pixelC = vec2(pixelPosDS.x + pixelPosDS.y, pixelPosDS.z + pixelPosDS.w);
-        vec4 cFull;
-        vec4 z0Full;
-        float sDirect;
-        if (uModeBlend <= 0.001) {
-            z0Full = vec4(uZ0.x, 0.0, uZ0.y, 0.0);
-            cFull = pixelPosDS;
-            sDirect = uPrecisionMode == 0
-                ? iterSmooth(uZ0, pixelC, maxIter)
-                : iterSmoothDS(z0Full, cFull, maxIter);
-        } else if (uModeBlend >= 0.999) {
-            z0Full = pixelPosDS;
-            cFull = vec4(uC.x, 0.0, uC.y, 0.0);
-            sDirect = uPrecisionMode == 0
-                ? juliaSmooth(pixelC, maxIter)
-                : juliaSmoothDS(z0Full, maxIter);
-        } else {
-            vec2 z0 = uModeBlend * pixelC;
-            vec2 c = (1.0 - uModeBlend) * pixelC + uModeBlend * uC;
-            vec2 z0x = dsMulFloat(pixelPosDS.xy, uModeBlend);
-            vec2 z0y = dsMulFloat(pixelPosDS.zw, uModeBlend);
-            vec2 cMixX = dsMulFloat(pixelPosDS.xy, 1.0 - uModeBlend);
-            vec2 cMixY = dsMulFloat(pixelPosDS.zw, 1.0 - uModeBlend);
-            vec2 cDSX = dsAdd(cMixX, vec2(uModeBlend * uC.x, 0.0));
-            vec2 cDSY = dsAdd(cMixY, vec2(uModeBlend * uC.y, 0.0));
-            z0Full = vec4(z0x.x, z0x.y, z0y.x, z0y.y);
-            cFull = vec4(cDSX.x, cDSX.y, cDSY.x, cDSY.y);
-            sDirect = uPrecisionMode == 0
-                ? iterSmooth(z0, c, maxIter)
-                : iterSmoothDS(z0Full, cFull, maxIter);
-        }
-
-        float s = sDirect;
-        if (uUsePerturb == 1 && uRefLength > 0) {
-            float dx = pixelPos.x - uResolution.x * 0.5;
-            float dy = uResolution.y * 0.5 - pixelPos.y;
-            vec2 dcx = dsAdd(uCenterRefOffsetX, dsMulFloat(uInvZoom, dx));
-            vec2 dcy = dsAdd(uCenterRefOffsetY, dsMulFloat(uInvZoom, dy));
-            vec4 dc = vec4(dcx.x, dcx.y, dcy.x, dcy.y);
-            float sPerturb = mandelbrotSmoothPerturb(dc, cFull, maxIter);
-            s = mix(sDirect, sPerturb, uPerturbBlend);
-        }
-        return colorFromSmooth(s);
-    }
-
-    vec2 clampToViewport(vec2 pixelPos) {
-        vec2 maxPixel = max(vec2(0.0), uResolution - vec2(1.0));
-        return clamp(pixelPos, vec2(0.0), maxPixel);
-    }
-
     void main() {
         vec2 screenPos = vPosition * 0.5 + 0.5;
         screenPos.y = 1.0 - screenPos.y;
-        vec2 pixelPos = clampToViewport(screenPos * uResolution);
-        float maxIter = float(uMaxIterations);
-        vec3 color = sampleColorAtPixel(pixelPos, maxIter);
+        vec2 pixelPos = screenPos * uResolution;
+        int limit = clamp(uMaxIterations, 1, ${MAX_ITERATIONS});
 
-        if (uLod >= 1) {
-            float j = 0.5;
-            vec3 a = sampleColorAtPixel(clampToViewport(pixelPos + vec2( j,  j)), maxIter);
-            vec3 b = sampleColorAtPixel(clampToViewport(pixelPos + vec2(-j,  j)), maxIter);
-            vec3 c = sampleColorAtPixel(clampToViewport(pixelPos + vec2( j, -j)), maxIter);
-            vec3 d = sampleColorAtPixel(clampToViewport(pixelPos + vec2(-j, -j)), maxIter);
-            color = (a + b + c + d) * 0.25;
+        vec4 pixelPosDS = pixelToComplexDS(pixelPos);
+        vec2 pixelC = vec2(pixelPosDS.x + pixelPosDS.y, pixelPosDS.z + pixelPosDS.w);
+
+        float s;
+        if (uModeBlend <= 0.001) {
+            // Mandelbrot: z0 fixed, c varies per pixel.
+            s = uPrecisionMode == 0
+                ? iterSmooth(uZ0, pixelC, limit)
+                : iterSmoothDS(vec4(uZ0.x, 0.0, uZ0.y, 0.0), pixelPosDS, limit);
+        } else if (uModeBlend >= 0.999) {
+            // Julia: z0 varies per pixel, c fixed.
+            s = uPrecisionMode == 0
+                ? iterSmooth(pixelC, uC, limit)
+                : iterSmoothDS(pixelPosDS, vec4(uC.x, 0.0, uC.y, 0.0), limit);
+        } else {
+            vec2 z0 = uModeBlend * pixelC;
+            vec2 c = (1.0 - uModeBlend) * pixelC + uModeBlend * uC;
+            if (uPrecisionMode == 0) {
+                s = iterSmooth(z0, c, limit);
+            } else {
+                vec2 z0x = dsMulFloat(pixelPosDS.xy, uModeBlend);
+                vec2 z0y = dsMulFloat(pixelPosDS.zw, uModeBlend);
+                vec2 cx = dsAdd(dsMulFloat(pixelPosDS.xy, 1.0 - uModeBlend), vec2(uModeBlend * uC.x, 0.0));
+                vec2 cy = dsAdd(dsMulFloat(pixelPosDS.zw, 1.0 - uModeBlend), vec2(uModeBlend * uC.y, 0.0));
+                s = iterSmoothDS(vec4(z0x, z0y), vec4(cx, cy), limit);
+            }
         }
-        if (uLod >= 2 && uPrecisionMode == 0) {
-            float j2 = 0.6;
-            vec3 d = sampleColorAtPixel(clampToViewport(pixelPos + vec2(-j2, -j2)), maxIter);
-            vec3 e = sampleColorAtPixel(clampToViewport(pixelPos + vec2( 0.0, -j2)), maxIter);
-            vec3 f = sampleColorAtPixel(clampToViewport(pixelPos + vec2( j2,  0.0)), maxIter);
-            vec3 g = sampleColorAtPixel(clampToViewport(pixelPos + vec2( 0.0,  j2)), maxIter);
-            vec3 h = sampleColorAtPixel(clampToViewport(pixelPos + vec2(-j2,  0.0)), maxIter);
-            color = (color * 4.0 + d + e + f + g + h) / 9.0;
-        }
-        finalColor = vec4(color, 1.0);
+
+        finalColor = vec4(colorFromSmooth(s), 1.0);
     }
 `;
 
@@ -514,7 +231,20 @@ function createProgram(gl: WebGL2RenderingContext): WebGLProgram {
     return program;
 }
 
-async function init() {
+const loader = document.getElementById('loader');
+
+function hideLoader() {
+    if (!loader) return;
+    loader.classList.add('loader-hidden');
+    loader.addEventListener('transitionend', () => loader.remove(), { once: true });
+}
+
+function showLoaderError(message: string) {
+    if (!loader) return;
+    loader.innerHTML = `<div class="loader-error">${message}</div>`;
+}
+
+function init() {
     type DoubleDouble = [number, number];
 
     const splitDouble = (value: number): [number, number] => {
@@ -535,10 +265,7 @@ async function init() {
         return twoSum(s[0], e);
     };
 
-    const ddSub = (a: DoubleDouble, b: DoubleDouble): DoubleDouble => ddAdd(a, [-b[0], -b[1]]);
-
     const ddFromNumber = (value: number): DoubleDouble => splitDouble(value);
-    const ddToNumber = (value: DoubleDouble): number => value[0] + value[1];
 
     const canvas = document.createElement('canvas');
     canvas.style.width = '100%';
@@ -552,19 +279,22 @@ async function init() {
         antialias: false,
         powerPreference: 'high-performance',
     });
-    if (!gl) throw new Error('WebGL2 not supported');
+    if (!gl) throw new Error('WebGL2 is not supported by this browser');
 
     const program = createProgram(gl);
+
+    const uniformNames = [
+        'uResolution', 'uCenterX', 'uCenterY', 'uInvZoom',
+        'uMaxIterations', 'uColorIterations', 'uPrecisionMode',
+        'uTime', 'uC', 'uZ0', 'uModeBlend', 'uExponent',
+    ] as const;
+    const loc: Record<(typeof uniformNames)[number], WebGLUniformLocation | null> = Object.fromEntries(
+        uniformNames.map((name) => [name, gl.getUniformLocation(program, name)]),
+    ) as Record<(typeof uniformNames)[number], WebGLUniformLocation | null>;
+
     const positionLoc = gl.getAttribLocation(program, 'aPosition');
-
-    const orbitTex = gl.createTexture()!;
-    gl.bindTexture(gl.TEXTURE_2D, orbitTex);
-    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA32F, ORBIT_CAPACITY, 1, 0, gl.RGBA, gl.FLOAT, null);
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
-
+    const vao = gl.createVertexArray();
+    gl.bindVertexArray(vao);
     const positions = new Float32Array([-1, -1, 1, -1, 1, 1, -1, 1]);
     const indices = new Uint16Array([0, 1, 2, 0, 2, 3]);
     const vbo = gl.createBuffer();
@@ -573,6 +303,9 @@ async function init() {
     const ebo = gl.createBuffer();
     gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, ebo);
     gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, indices, gl.STATIC_DRAW);
+    gl.enableVertexAttribArray(positionLoc);
+    gl.vertexAttribPointer(positionLoc, 2, gl.FLOAT, false, 0, 0);
+    gl.useProgram(program);
 
     const resize = () => {
         const dpr = window.devicePixelRatio || 1;
@@ -655,7 +388,6 @@ async function init() {
         zoom: createParamRow('Zoom'),
         iterations: createParamRow('Iterations'),
         fps: createParamRow('FPS'),
-        quality: createParamRow('Capacity'),
     };
 
     const normalize = (value: number, min: number, max: number) => {
@@ -666,76 +398,6 @@ async function init() {
     let cameraCenterXDD: DoubleDouble = ddFromNumber(-0.5);
     let cameraCenterYDD: DoubleDouble = ddFromNumber(0);
     let cameraZoom = baseZoom;
-    const perturbWorker = new Worker(new URL('./perturbationWorker.ts', import.meta.url), { type: 'module' });
-    let refLength = 0;
-    let refRequestId = 0;
-    let latestAppliedOrbitId = 0;
-    let pendingOrbitRequest = false;
-    let lastOrbitCenterXDD: DoubleDouble = [cameraCenterXDD[0], cameraCenterXDD[1]];
-    let lastOrbitCenterYDD: DoubleDouble = [cameraCenterYDD[0], cameraCenterYDD[1]];
-    let lastOrbitZoom = cameraZoom;
-    let lastOrbitModeBlend = 0;
-    let lastOrbitCRe = 0.285;
-    let lastOrbitCIm = 0.01;
-    let lastOrbitZ0Re = 0;
-    let lastOrbitZ0Im = 0;
-    let lastOrbitExponent = 2;
-    let requestedOrbitCenterXDD: DoubleDouble = [cameraCenterXDD[0], cameraCenterXDD[1]];
-    let requestedOrbitCenterYDD: DoubleDouble = [cameraCenterYDD[0], cameraCenterYDD[1]];
-    let requestedOrbitZoom = cameraZoom;
-    let requestedOrbitModeBlend = 0;
-    let requestedOrbitCRe = 0.285;
-    let requestedOrbitCIm = 0.01;
-    let requestedOrbitZ0Re = 0;
-    let requestedOrbitZ0Im = 0;
-    let requestedOrbitExponent = 2;
-    let cameraVersion = 0;
-    let activeOrbitVersion = -1;
-    const requestVersionById = new Map<number, number>();
-    const orbitCache: Array<{
-        centerX: number;
-        centerY: number;
-        zoom: number;
-        modeBlend: number;
-        cRe: number;
-        cIm: number;
-        z0Re: number;
-        z0Im: number;
-        exponent: number;
-        length: number;
-        orbit: Float32Array;
-        usedAt: number;
-    }> = [];
-
-    const applyOrbit = (
-        orbit: Float32Array,
-        length: number,
-        centerX: number,
-        centerY: number,
-        zoom: number,
-        version: number,
-    ) => {
-        refLength = Math.min(length, ORBIT_CAPACITY);
-        gl.bindTexture(gl.TEXTURE_2D, orbitTex);
-        gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, refLength, 1, gl.RGBA, gl.FLOAT, orbit);
-        uniforms.uRefLength = refLength;
-        const [refXHi, refXLo] = splitDouble(centerX);
-        const [refYHi, refYLo] = splitDouble(centerY);
-        uniforms.uRefCenterX[0] = refXHi;
-        uniforms.uRefCenterX[1] = refXLo;
-        uniforms.uRefCenterY[0] = refYHi;
-        uniforms.uRefCenterY[1] = refYLo;
-        lastOrbitCenterXDD = ddFromNumber(centerX);
-        lastOrbitCenterYDD = ddFromNumber(centerY);
-        lastOrbitZoom = zoom;
-        lastOrbitModeBlend = modeBlend;
-        lastOrbitCRe = uniforms.uC[0];
-        lastOrbitCIm = uniforms.uC[1];
-        lastOrbitZ0Re = uniforms.uZ0[0];
-        lastOrbitZ0Im = uniforms.uZ0[1];
-        lastOrbitExponent = exponent;
-        activeOrbitVersion = version;
-    };
 
     const uniforms = {
         uResolution: new Float32Array([window.innerWidth, window.innerHeight]),
@@ -744,17 +406,7 @@ async function init() {
         uInvZoom: new Float32Array(splitDouble(1 / cameraZoom)),
         uMaxIterations: 200,
         uColorIterations: 320,
-        uLod: 0,
         uPrecisionMode: 0,
-        uUsePerturb: 0,
-        uPerturbBlend: 0,
-        uRefLength: 0,
-        uRefCenterX: new Float32Array([cameraCenterXDD[0], cameraCenterXDD[1]]),
-        uRefCenterY: new Float32Array([cameraCenterYDD[0], cameraCenterYDD[1]]),
-        uCenterRefOffsetX: new Float32Array(splitDouble(0)),
-        uCenterRefOffsetY: new Float32Array(splitDouble(0)),
-        uPerturbDcCoeff: 1,
-        uPerturbDz0Coeff: 0,
         uTime: 0,
         uC: new Float32Array([0.285, 0.01]),
         uZ0: new Float32Array([0, 0]),
@@ -859,7 +511,6 @@ async function init() {
         if (e.buttons & 1 && dragStart) {
             const dx = x - dragStart.x;
             const dy = y - dragStart.y;
-            lastInteractionAt = performance.now();
             const rawReal = dragStart.real + paramSensitivity * dx;
             const rawImag = dragStart.imag - paramSensitivity * dy;
             if (dragStart.isJulia) {
@@ -878,15 +529,11 @@ async function init() {
             const dy = y - panStart.y;
             cameraCenterXDD = ddAdd(panStart.centerX, ddFromNumber(-dx / cameraZoom));
             cameraCenterYDD = ddAdd(panStart.centerY, ddFromNumber(dy / cameraZoom));
-            lastInteractionAt = performance.now();
-            cameraVersion += 1;
-            activeOrbitVersion = -1;
         } else if ((e.buttons & 2) && blendDragStart) {
             const dx = x - blendDragStart.x;
             const dy = y - blendDragStart.y;
             modeBlend = Math.max(0, Math.min(1, blendDragStart.blend + blendSensitivity * dx));
             exponent = Math.max(1.01, Math.min(8, blendDragStart.exponent - exponentSensitivity * dy));
-            lastInteractionAt = performance.now();
         }
     };
     const onPointerUp = (e: PointerEvent) => {
@@ -903,21 +550,16 @@ async function init() {
     const onWheel = (e: WheelEvent) => {
         e.preventDefault();
         const { x, y } = getCanvasCoords(e.clientX, e.clientY);
-        const resX = canvas.width;
-        const resY = canvas.height;
-        const dx = x - resX * 0.5;
-        const dy = resY * 0.5 - y;
+        const dx = x - canvas.width * 0.5;
+        const dy = canvas.height * 0.5 - y;
         const zoomFactor = e.deltaY > 0 ? 1 / WHEEL_ZOOM_FACTOR : WHEEL_ZOOM_FACTOR;
         const k = Math.pow(zoomFactor, Math.min(3, Math.abs(e.deltaY) / 50));
-        const newZoom = Math.max(1e-3, Math.min(Number.MAX_VALUE, cameraZoom * k));
+        const newZoom = Math.max(MIN_ZOOM, Math.min(MAX_ZOOM, cameraZoom * k));
         const invZoom = 1 / cameraZoom;
         const invNewZoom = 1 / newZoom;
         cameraCenterXDD = ddAdd(cameraCenterXDD, ddFromNumber(dx * (invZoom - invNewZoom)));
         cameraCenterYDD = ddAdd(cameraCenterYDD, ddFromNumber(dy * (invZoom - invNewZoom)));
         cameraZoom = newZoom;
-        lastInteractionAt = performance.now();
-        cameraVersion += 1;
-        activeOrbitVersion = -1;
     };
 
     const onTouchStart = (e: TouchEvent) => {
@@ -966,7 +608,6 @@ async function init() {
             const { x, y } = getCanvasCoords(touch.clientX, touch.clientY);
             const dx = x - dragStart.x;
             const dy = y - dragStart.y;
-            lastInteractionAt = performance.now();
             const rawReal = dragStart.real + paramSensitivity * dx;
             const rawImag = dragStart.imag - paramSensitivity * dy;
             if (dragStart.isJulia) {
@@ -1003,10 +644,7 @@ async function init() {
 
             const distance = Math.max(1, getTouchDistance(a, b));
             const zoomScale = distance / pinchStart.distance;
-            cameraZoom = Math.max(1e-3, Math.min(Number.MAX_VALUE, pinchStart.zoom * zoomScale));
-            cameraVersion += 1;
-            activeOrbitVersion = -1;
-            lastInteractionAt = performance.now();
+            cameraZoom = Math.max(MIN_ZOOM, Math.min(MAX_ZOOM, pinchStart.zoom * zoomScale));
         }
         e.preventDefault();
     };
@@ -1057,91 +695,25 @@ async function init() {
         }
     });
 
-    perturbWorker.onmessage = (event: MessageEvent<{ id: number; length: number; orbit: Float32Array }>) => {
-        pendingOrbitRequest = false;
-        const { id, length, orbit } = event.data;
-        if (id < latestAppliedOrbitId) return;
-        const version = requestVersionById.get(id);
-        requestVersionById.delete(id);
-        if (version === undefined || version !== cameraVersion) return;
-        const paramsMatch = Math.abs(uniforms.uC[0] - requestedOrbitCRe) + Math.abs(uniforms.uC[1] - requestedOrbitCIm)
-            + Math.abs(uniforms.uZ0[0] - requestedOrbitZ0Re) + Math.abs(uniforms.uZ0[1] - requestedOrbitZ0Im)
-            + Math.abs(exponent - requestedOrbitExponent) < 1e-9;
-        if (!paramsMatch) return;
-
-        latestAppliedOrbitId = id;
-        const requestedOrbitCenterX = ddToNumber(requestedOrbitCenterXDD);
-        const requestedOrbitCenterY = ddToNumber(requestedOrbitCenterYDD);
-        applyOrbit(orbit, length, requestedOrbitCenterX, requestedOrbitCenterY, requestedOrbitZoom, version);
-        orbitUpdatedSinceLastFrame = true;
-
-        orbitCache.push({
-            centerX: requestedOrbitCenterX,
-            centerY: requestedOrbitCenterY,
-            zoom: requestedOrbitZoom,
-            modeBlend: requestedOrbitModeBlend,
-            cRe: requestedOrbitCRe,
-            cIm: requestedOrbitCIm,
-            z0Re: requestedOrbitZ0Re,
-            z0Im: requestedOrbitZ0Im,
-            exponent: requestedOrbitExponent,
-            length: Math.min(length, ORBIT_CAPACITY),
-            orbit: new Float32Array(orbit.subarray(0, length * ORBIT_FLOATS_PER_POINT)),
-            usedAt: performance.now(),
-        });
-        if (orbitCache.length > ORBIT_CACHE_LIMIT) {
-            orbitCache.sort((a, b) => b.usedAt - a.usedAt);
-            orbitCache.length = ORBIT_CACHE_LIMIT;
-        }
-    };
-
-    let lastInteractionAt = performance.now();
-    let smoothedPerturbBlend = 0;
-    let currentIterations = 220;
-    let qualityScale = 1.0;
-    let smoothedFrameMs = 1000 / 60;
-    let discoveredCapacity = currentIterations;
-    let colorIterations = 320;
-    let lodState = 1;
-    let orbitUpdatedSinceLastFrame = false;
-    let lastAdaptiveUpdateAt = 0;
-    let lastFrameTime = performance.now();
-
-    const uniformLocations: Record<string, WebGLUniformLocation | null> = {};
-    const getLoc = (name: string) => {
-        if (!(name in uniformLocations)) {
-            uniformLocations[name] = gl.getUniformLocation(program, name);
-        }
-        return uniformLocations[name];
-    };
-
     const setUniforms = () => {
-        gl.uniform2fv(getLoc('uResolution'), uniforms.uResolution);
-        gl.uniform2fv(getLoc('uCenterX'), uniforms.uCenterX);
-        gl.uniform2fv(getLoc('uCenterY'), uniforms.uCenterY);
-        gl.uniform2fv(getLoc('uInvZoom'), uniforms.uInvZoom);
-        gl.uniform1i(getLoc('uMaxIterations'), uniforms.uMaxIterations);
-        gl.uniform1i(getLoc('uColorIterations'), uniforms.uColorIterations);
-        gl.uniform1i(getLoc('uLod'), uniforms.uLod);
-        gl.uniform1i(getLoc('uPrecisionMode'), uniforms.uPrecisionMode);
-        gl.uniform1i(getLoc('uUsePerturb'), uniforms.uUsePerturb);
-        gl.uniform1f(getLoc('uPerturbBlend'), uniforms.uPerturbBlend);
-        gl.uniform1i(getLoc('uRefLength'), uniforms.uRefLength);
-        gl.uniform2fv(getLoc('uRefCenterX'), uniforms.uRefCenterX);
-        gl.uniform2fv(getLoc('uRefCenterY'), uniforms.uRefCenterY);
-        gl.activeTexture(gl.TEXTURE0);
-        gl.bindTexture(gl.TEXTURE_2D, orbitTex);
-        gl.uniform1i(getLoc('uRefOrbitTex'), 0);
-        gl.uniform2fv(getLoc('uCenterRefOffsetX'), uniforms.uCenterRefOffsetX);
-        gl.uniform2fv(getLoc('uCenterRefOffsetY'), uniforms.uCenterRefOffsetY);
-        gl.uniform1f(getLoc('uPerturbDcCoeff'), uniforms.uPerturbDcCoeff);
-        gl.uniform1f(getLoc('uPerturbDz0Coeff'), uniforms.uPerturbDz0Coeff);
-        gl.uniform1f(getLoc('uTime'), uniforms.uTime);
-        gl.uniform2fv(getLoc('uC'), uniforms.uC);
-        gl.uniform2fv(getLoc('uZ0'), uniforms.uZ0);
-        gl.uniform1f(getLoc('uModeBlend'), uniforms.uModeBlend);
-        gl.uniform1f(getLoc('uExponent'), uniforms.uExponent);
+        gl.uniform2fv(loc.uResolution, uniforms.uResolution);
+        gl.uniform2fv(loc.uCenterX, uniforms.uCenterX);
+        gl.uniform2fv(loc.uCenterY, uniforms.uCenterY);
+        gl.uniform2fv(loc.uInvZoom, uniforms.uInvZoom);
+        gl.uniform1i(loc.uMaxIterations, uniforms.uMaxIterations);
+        gl.uniform1i(loc.uColorIterations, uniforms.uColorIterations);
+        gl.uniform1i(loc.uPrecisionMode, uniforms.uPrecisionMode);
+        gl.uniform1f(loc.uTime, uniforms.uTime);
+        gl.uniform2fv(loc.uC, uniforms.uC);
+        gl.uniform2fv(loc.uZ0, uniforms.uZ0);
+        gl.uniform1f(loc.uModeBlend, uniforms.uModeBlend);
+        gl.uniform1f(loc.uExponent, uniforms.uExponent);
     };
+
+    let smoothedFrameMs = 1000 / 60;
+    let lastFrameTime = performance.now();
+    let lastHudUpdateAt = 0;
+    let firstFrameDrawn = false;
 
     const tick = () => {
         if (document.hidden) {
@@ -1151,31 +723,18 @@ async function init() {
         const nowMs = performance.now();
         const frameMs = nowMs - lastFrameTime;
         lastFrameTime = nowMs;
+        smoothedFrameMs = smoothedFrameMs * 0.95 + frameMs * 0.05;
 
-        const res = canvas.width;
-        const resY = canvas.height;
-        const idleMs = nowMs - lastInteractionAt;
-        const activeInput = dragStart !== null
-            || panStart !== null
-            || blendDragStart !== null
-            || touchTwoFingerStart !== null
-            || pinchStart !== null;
-        const activelyInteracting = activeInput || idleMs < 180;
-        const centerXHi = cameraCenterXDD[0];
-        const centerXLo = cameraCenterXDD[1];
-        const centerYHi = cameraCenterYDD[0];
-        const centerYLo = cameraCenterYDD[1];
+        uniforms.uResolution[0] = canvas.width;
+        uniforms.uResolution[1] = canvas.height;
+        uniforms.uCenterX[0] = cameraCenterXDD[0];
+        uniforms.uCenterX[1] = cameraCenterXDD[1];
+        uniforms.uCenterY[0] = cameraCenterYDD[0];
+        uniforms.uCenterY[1] = cameraCenterYDD[1];
         const [invZoomHi, invZoomLo] = splitDouble(1 / cameraZoom);
-
-        uniforms.uResolution[0] = res;
-        uniforms.uResolution[1] = resY;
-        uniforms.uCenterX[0] = centerXHi;
-        uniforms.uCenterX[1] = centerXLo;
-        uniforms.uCenterY[0] = centerYHi;
-        uniforms.uCenterY[1] = centerYLo;
         uniforms.uInvZoom[0] = invZoomHi;
         uniforms.uInvZoom[1] = invZoomLo;
-        const t = performance.now() * 0.001;
+        const t = nowMs * 0.001;
         uniforms.uTime = t;
 
         const wobblePeriod = 90.0;
@@ -1257,223 +816,40 @@ async function init() {
         lastFrameUsedFormulaC = mouseControlC === null && !animationPaused;
         lastFrameUsedFormulaZ0 = mouseControlZ0 === null && !animationPaused;
         lastFrameUsedFormulaBlend = !animationPaused && blendDragStart === null;
-        const hadOrbitUpdate = orbitUpdatedSinceLastFrame;
-        const dynamicUpdate = activelyInteracting || !animationPaused || hadOrbitUpdate;
-        const interactionDebounceReady = !activelyInteracting
-            || (nowMs - lastAdaptiveUpdateAt) >= INTERACTION_RECALC_DEBOUNCE_MS;
-        const adaptiveUpdate = dynamicUpdate && (
-            hadOrbitUpdate
-            || !activelyInteracting
-            || !animationPaused
-            || interactionDebounceReady
-        );
-        if (adaptiveUpdate) {
-            lastAdaptiveUpdateAt = nowMs;
-        }
-        orbitUpdatedSinceLastFrame = false;
 
-        const targetFrameMs = 1000 / TARGET_FPS;
+        // Deterministic quality: same zoom always renders identically.
         const zoom = cameraZoom;
-        if (adaptiveUpdate) {
-            smoothedFrameMs = smoothedFrameMs * 0.95 + frameMs * 0.05;
-            if (smoothedFrameMs > targetFrameMs * 1.2) {
-                qualityScale *= 0.995;
-            } else if (smoothedFrameMs < targetFrameMs * 0.9) {
-                qualityScale *= 1.005;
-            }
-            if (frameMs > targetFrameMs * 2.0) {
-                qualityScale *= 0.98;
-            }
-            qualityScale = Math.max(QUALITY_MIN, Math.min(QUALITY_MAX, qualityScale));
-        }
-        const effectiveQuality = activelyInteracting ? Math.max(QUALITY_MIN, qualityScale * 0.85) : qualityScale;
+        const iterBase = Math.min(MAX_ITERATIONS, Math.floor(50 + Math.log2(Math.max(1, zoom)) * 60));
+        uniforms.uMaxIterations = iterBase;
+        uniforms.uColorIterations = iterBase;
+        uniforms.uPrecisionMode = zoom > FLOAT_PRECISION_MAX_ZOOM ? 1 : 0;
 
-        const logZoom = Math.log10(Math.max(1, zoom));
-        const lodFromZoom = logZoom < 2 ? 0 : (logZoom < 4 ? 1 : 2);
-        if (adaptiveUpdate) {
-            if (lodState <= 0) {
-                if (lodFromZoom >= 1 && effectiveQuality > 0.7) lodState = 1;
-            } else if (lodState === 1) {
-                if (lodFromZoom < 1 || effectiveQuality < 0.5) lodState = 0;
-                else if (lodFromZoom >= 2 && effectiveQuality > 1.2 && !activelyInteracting) lodState = 2;
-            } else {
-                if (lodFromZoom < 2 || effectiveQuality < 0.9) lodState = 1;
-            }
-        }
-        uniforms.uLod = lodState;
-        uniforms.uPrecisionMode = 1;
-
-        const cameraCenterX = ddToNumber(cameraCenterXDD);
-        const cameraCenterY = ddToNumber(cameraCenterYDD);
-        const lastOrbitCenterX = ddToNumber(lastOrbitCenterXDD);
-        const lastOrbitCenterY = ddToNumber(lastOrbitCenterYDD);
-
-        const orbitDriftPxRaw = Math.hypot(
-            (cameraCenterX - lastOrbitCenterX) * zoom,
-            (cameraCenterY - lastOrbitCenterY) * zoom,
-        );
-        const orbitZoomDeltaRaw = Math.abs(Math.log2(Math.max(1e-12, zoom / lastOrbitZoom)));
-        const orbitModeBlendDelta = Math.abs(modeBlend - lastOrbitModeBlend);
-        const orbitParamDelta = Math.abs(uniforms.uC[0] - lastOrbitCRe) + Math.abs(uniforms.uC[1] - lastOrbitCIm)
-            + Math.abs(uniforms.uZ0[0] - lastOrbitZ0Re) + Math.abs(uniforms.uZ0[1] - lastOrbitZ0Im)
-            + Math.abs(exponent - lastOrbitExponent);
-        const orbitStaleRaw = orbitDriftPxRaw > 48 || orbitZoomDeltaRaw > 0.3 || orbitModeBlendDelta > 0.02 || orbitParamDelta > 1e-9;
-
-        if ((orbitStaleRaw || refLength === 0) && activeOrbitVersion !== cameraVersion) {
-            let best: (typeof orbitCache)[number] | null = null;
-            let bestScore = Number.POSITIVE_INFINITY;
-            for (const entry of orbitCache) {
-                if (Math.abs(entry.modeBlend - modeBlend) > 0.02) continue;
-                if (Math.abs(entry.cRe - uniforms.uC[0]) + Math.abs(entry.cIm - uniforms.uC[1]) > 1e-9) continue;
-                if (Math.abs(entry.z0Re - uniforms.uZ0[0]) + Math.abs(entry.z0Im - uniforms.uZ0[1]) > 1e-9) continue;
-                if (Math.abs(entry.exponent - exponent) > 0.01) continue;
-                const driftPx = Math.hypot(
-                    (cameraCenterX - entry.centerX) * zoom,
-                    (cameraCenterY - entry.centerY) * zoom,
-                );
-                const zoomDelta = Math.abs(Math.log2(Math.max(1e-12, zoom / entry.zoom)));
-                if (driftPx > 72 || zoomDelta > 0.45) continue;
-                const score = driftPx + zoomDelta * 120;
-                if (score < bestScore) {
-                    best = entry;
-                    bestScore = score;
-                }
-            }
-            if (best) {
-                best.usedAt = performance.now();
-                lastOrbitModeBlend = best.modeBlend;
-                applyOrbit(best.orbit, best.length, best.centerX, best.centerY, best.zoom, cameraVersion);
-            }
-        }
-
-        const orbitDriftPx = Math.hypot(
-            (cameraCenterX - lastOrbitCenterX) * zoom,
-            (cameraCenterY - lastOrbitCenterY) * zoom,
-        );
-        const orbitZoomDelta = Math.abs(Math.log2(Math.max(1e-12, zoom / lastOrbitZoom)));
-        const orbitParamStale = Math.abs(uniforms.uC[0] - lastOrbitCRe) + Math.abs(uniforms.uC[1] - lastOrbitCIm)
-            + Math.abs(uniforms.uZ0[0] - lastOrbitZ0Re) + Math.abs(uniforms.uZ0[1] - lastOrbitZ0Im)
-            + Math.abs(exponent - lastOrbitExponent) > 1e-9;
-        const orbitStale = orbitDriftPx > 48 || orbitZoomDelta > 0.3 || Math.abs(modeBlend - lastOrbitModeBlend) > 0.02 || orbitParamStale;
-
-        const usePerturb = refLength > 0 && zoom > 2e5 && Math.abs(exponent - 2) < 0.01;
-        const perturbTarget = usePerturb
-            ? (orbitStale ? (activelyInteracting ? 0.6 : 0.15) : 1.0)
-            : 0.0;
-        const perturbSmoothFactor = activelyInteracting ? 0.12 : 0.25;
-        smoothedPerturbBlend += (perturbTarget - smoothedPerturbBlend) * perturbSmoothFactor;
-        uniforms.uUsePerturb = usePerturb ? 1 : 0;
-        uniforms.uPerturbBlend = smoothedPerturbBlend;
-        uniforms.uPerturbDcCoeff = 1 - modeBlend;
-        uniforms.uPerturbDz0Coeff = modeBlend;
-        if (usePerturb) {
-            const [offXHi, offXLo] = ddSub(cameraCenterXDD, lastOrbitCenterXDD);
-            const [offYHi, offYLo] = ddSub(cameraCenterYDD, lastOrbitCenterYDD);
-            uniforms.uCenterRefOffsetX[0] = offXHi;
-            uniforms.uCenterRefOffsetX[1] = offXLo;
-            uniforms.uCenterRefOffsetY[0] = offYHi;
-            uniforms.uCenterRefOffsetY[1] = offYLo;
-        }
-
-        const shouldRequestOrbit = zoom > 2e5
-            && !pendingOrbitRequest
-            && (activeOrbitVersion !== cameraVersion || orbitStale || idleMs > 800 || refLength === 0);
-        if (shouldRequestOrbit) {
-            pendingOrbitRequest = true;
-            refRequestId += 1;
-            requestVersionById.set(refRequestId, cameraVersion);
-            requestedOrbitCenterXDD = [cameraCenterXDD[0], cameraCenterXDD[1]];
-            requestedOrbitCenterYDD = [cameraCenterYDD[0], cameraCenterYDD[1]];
-            requestedOrbitZoom = zoom;
-            requestedOrbitModeBlend = modeBlend;
-            requestedOrbitCRe = uniforms.uC[0];
-            requestedOrbitCIm = uniforms.uC[1];
-            requestedOrbitZ0Re = uniforms.uZ0[0];
-            requestedOrbitZ0Im = uniforms.uZ0[1];
-            requestedOrbitExponent = exponent;
-            const reqXHi = cameraCenterXDD[0];
-            const reqXLo = cameraCenterXDD[1];
-            const reqYHi = cameraCenterYDD[0];
-            const reqYLo = cameraCenterYDD[1];
-            // Keep extra decimal margin so reference orbit remains stable at deep zoom.
+        if (nowMs - lastHudUpdateAt >= HUD_UPDATE_INTERVAL_MS) {
+            lastHudUpdateAt = nowMs;
+            const cReal = uniforms.uC[0];
+            const cImag = uniforms.uC[1];
+            const z0Real = uniforms.uZ0[0];
+            const z0Imag = uniforms.uZ0[1];
+            paramRows.modeBlend.set(modeBlend, modeBlend.toFixed(2));
+            paramRows.exponent.set(normalize(exponent, 1.01, 8), exponent.toFixed(2));
+            paramRows.cReal.set(normalize(cReal, cLimits.realMin, cLimits.realMax), cReal.toFixed(3));
+            paramRows.cImag.set(normalize(cImag, cLimits.imagMin, cLimits.imagMax), cImag.toFixed(3));
+            paramRows.z0Real.set(normalize(z0Real, z0Limits.realMin, z0Limits.realMax), z0Real.toFixed(3));
+            paramRows.z0Imag.set(normalize(z0Imag, z0Limits.imagMin, z0Limits.imagMax), z0Imag.toFixed(3));
             const logZoom = Math.log10(Math.max(1, zoom));
-            const iterHint = Math.max(ORBIT_CAPACITY, uniforms.uMaxIterations);
-            const precisionDigits = Math.min(
-                512,
-                Math.max(64, Math.ceil(logZoom) + 28, Math.ceil(Math.log2(iterHint + 1)) * 14),
-            );
-            const orbitMode = modeBlend <= 0.001 ? 'mandelbrot' : (modeBlend >= 0.999 ? 'julia' : 'blended');
-            perturbWorker.postMessage({
-                id: refRequestId,
-                centerXHi: reqXHi,
-                centerXLo: reqXLo,
-                centerYHi: reqYHi,
-                centerYLo: reqYLo,
-                maxIterations: ORBIT_CAPACITY,
-                precisionDigits,
-                mode: orbitMode,
-                modeBlend: modeBlend,
-                cReal: uniforms.uC[0],
-                cImag: uniforms.uC[1],
-                z0Real: uniforms.uZ0[0],
-                z0Imag: uniforms.uZ0[1],
-                exponent,
-            });
+            paramRows.zoom.set(Math.min(1, logZoom / Math.log10(MAX_ZOOM)), zoom.toExponential(2));
+            paramRows.iterations.set(iterBase / MAX_ITERATIONS, iterBase.toString());
+            const fps = 1000 / Math.max(0.0001, smoothedFrameMs);
+            paramRows.fps.set(Math.min(1, fps / 120), fps.toFixed(1));
         }
-
-        if (adaptiveUpdate) {
-            const iterBase = 50 + Math.log2(Math.max(1, zoom)) * 60;
-            const iterTarget = Math.min(4096, Math.floor(iterBase * effectiveQuality));
-            const maxStepUp = 40;
-            const maxStepDown = 2;
-            if (currentIterations < iterTarget) {
-                currentIterations = Math.min(iterTarget, currentIterations + maxStepUp);
-            } else {
-                currentIterations = Math.max(iterTarget, currentIterations - maxStepDown);
-            }
-            uniforms.uMaxIterations = Math.floor(currentIterations);
-
-            const colorTarget = Math.min(4096, Math.floor(iterBase));
-            if (colorIterations < colorTarget) {
-                colorIterations = Math.min(colorTarget, colorIterations + 12);
-            } else {
-                colorIterations = Math.max(colorTarget, colorIterations - 1);
-            }
-            uniforms.uColorIterations = colorIterations;
-            if (!activelyInteracting && smoothedFrameMs <= targetFrameMs * 1.04) {
-                discoveredCapacity = Math.max(discoveredCapacity, uniforms.uMaxIterations);
-            }
-        }
-
-        const cReal = uniforms.uC[0];
-        const cImag = uniforms.uC[1];
-        const z0Real = uniforms.uZ0[0];
-        const z0Imag = uniforms.uZ0[1];
-
-        paramRows.modeBlend.set(modeBlend, modeBlend.toFixed(2));
-        paramRows.exponent.set(normalize(exponent, 1.01, 8), exponent.toFixed(2));
-        paramRows.cReal.set(normalize(cReal, cLimits.realMin, cLimits.realMax), cReal.toFixed(3));
-        paramRows.cImag.set(normalize(cImag, cLimits.imagMin, cLimits.imagMax), cImag.toFixed(3));
-        paramRows.z0Real.set(normalize(z0Real, z0Limits.realMin, z0Limits.realMax), z0Real.toFixed(3));
-        paramRows.z0Imag.set(normalize(z0Imag, z0Limits.imagMin, z0Limits.imagMax), z0Imag.toFixed(3));
-
-        paramRows.zoom.set(Math.min(1, logZoom / 12), zoom.toExponential(2));
-        const maxIterations = uniforms.uMaxIterations;
-        paramRows.iterations.set(Math.min(1, maxIterations / 4096), maxIterations.toString());
-        const fps = 1000 / Math.max(0.0001, smoothedFrameMs);
-        paramRows.fps.set(Math.min(1, fps / 120), fps.toFixed(1));
-        paramRows.quality.set(
-            Math.min(1, discoveredCapacity / 4096),
-            `${Math.round(qualityScale * 100)}% (${discoveredCapacity} it)`,
-        );
 
         setUniforms();
-        gl.useProgram(program);
-        gl.bindBuffer(gl.ARRAY_BUFFER, vbo);
-        gl.enableVertexAttribArray(positionLoc);
-        gl.vertexAttribPointer(positionLoc, 2, gl.FLOAT, false, 0, 0);
-        gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, ebo);
         gl.drawElements(gl.TRIANGLES, 6, gl.UNSIGNED_SHORT, 0);
+
+        if (!firstFrameDrawn) {
+            firstFrameDrawn = true;
+            hideLoader();
+        }
 
         requestAnimationFrame(tick);
     };
@@ -1485,11 +861,14 @@ async function init() {
         resize();
         const newMin = Math.min(canvas.width, canvas.height);
         if (oldMin > 0 && newMin > 0 && oldMin !== newMin) {
-            cameraZoom *= newMin / oldMin;
+            cameraZoom = Math.max(MIN_ZOOM, Math.min(MAX_ZOOM, cameraZoom * (newMin / oldMin)));
         }
-        cameraVersion += 1;
-        activeOrbitVersion = -1;
     });
 }
 
-init().catch(console.error);
+try {
+    init();
+} catch (error) {
+    console.error(error);
+    showLoaderError(error instanceof Error ? error.message : 'Failed to start the fractal renderer');
+}
