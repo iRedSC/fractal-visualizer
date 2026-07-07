@@ -46,7 +46,7 @@ canvas {
 
 .controls-panel {
     right: 12px;
-    width: min(calc(100vw - 24px), 300px);
+    width: min(calc(100vw - 24px), 320px);
     padding: 8px 12px 10px;
 }
 
@@ -77,26 +77,38 @@ canvas {
 
 .controls-list {
     margin: 0;
-    padding-left: 1.1em;
-    list-style-position: outside;
+    padding: 0;
+    list-style: none;
 }
 
 .controls-list li {
-    margin: 0 0 5px;
-    padding-left: 0.15em;
-    opacity: 0.94;
+    display: grid;
+    grid-template-columns: 6.85rem minmax(0, 1fr);
+    column-gap: 0.55rem;
+    align-items: start;
+    margin: 0 0 0.45rem;
 }
 
 .controls-list li:last-child {
     margin-bottom: 0;
 }
 
-.controls-list strong {
-    display: inline-block;
-    min-width: 5.75em;
-    margin-right: 0.35em;
+.control-key {
     font-weight: 650;
     color: rgba(236, 242, 255, 0.98);
+    line-height: 1.45;
+}
+
+.control-key::after {
+    content: ':';
+    margin-left: 0.05em;
+    font-weight: 500;
+    color: rgba(190, 210, 255, 0.72);
+}
+
+.control-desc {
+    color: rgba(214, 226, 255, 0.9);
+    line-height: 1.45;
 }
 
 .params-panel {

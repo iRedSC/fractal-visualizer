@@ -331,18 +331,18 @@ function init() {
         <div class="controls-body">
             <p class="controls-group-label">Desktop</p>
             <ul class="controls-list">
-                <li><strong>Scroll</strong> zoom in/out</li>
-                <li><strong>Middle drag</strong> pan camera</li>
-                <li><strong>Left drag</strong> adjust active parameter (Julia C / Mandelbrot z0)</li>
-                <li><strong>Right drag</strong> blend mode (X) and exponent (Y)</li>
-                <li><strong>Double-click</strong> release manual C / z0 control</li>
-                <li><strong>Space</strong> pause/resume animation</li>
+                <li><span class="control-key">Scroll</span><span class="control-desc">Zoom in/out</span></li>
+                <li><span class="control-key">Middle drag</span><span class="control-desc">Pan camera</span></li>
+                <li><span class="control-key">Left drag</span><span class="control-desc">Adjust active parameter (Julia C / Mandelbrot z0)</span></li>
+                <li><span class="control-key">Right drag</span><span class="control-desc">Blend mode (X) and exponent (Y)</span></li>
+                <li><span class="control-key">Double-click</span><span class="control-desc">Release manual C / z0 control</span></li>
+                <li><span class="control-key">Space</span><span class="control-desc">Pause or resume animation</span></li>
             </ul>
             <p class="controls-group-label">Mobile</p>
             <ul class="controls-list">
-                <li><strong>1 finger</strong> same as left drag</li>
-                <li><strong>2 fingers</strong> same as right drag</li>
-                <li><strong>Pinch</strong> zoom</li>
+                <li><span class="control-key">1 finger</span><span class="control-desc">Same as left drag</span></li>
+                <li><span class="control-key">2 fingers</span><span class="control-desc">Same as right drag</span></li>
+                <li><span class="control-key">Pinch</span><span class="control-desc">Zoom</span></li>
             </ul>
         </div>
     `;
